@@ -7,7 +7,6 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -15,6 +14,11 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
+
+try:
+    import lerobot.datasets.lerobot_dataset as lerobot_dataset
+except ModuleNotFoundError:
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -127,26 +131,144 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class IndexedDataset(Dataset):
+    """Wrap a dataset and expose only a subset of indices."""
+
+    def __init__(self, dataset: Dataset, indices: Sequence[int]):
+        self._dataset = dataset
+        self._indices = list(indices)
+
+    def __getitem__(self, index: SupportsIndex):
+        return self._dataset[self._indices[index.__index__()]]
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+
+def _scalar_int(value) -> int:
+    if hasattr(value, "item"):
+        return int(value.item())
+    if isinstance(value, (list, tuple, np.ndarray)) and len(value) > 0:
+        return int(value[0])
+    return int(value)
+
+
+def _is_fake_data(data_config: _config.DataConfig) -> bool:
+    if data_config.repo_id == "fake":
+        return True
+    return len(data_config.repo_ids) == 1 and data_config.repo_ids[0] == "fake"
+
+
+def _iter_subdatasets(dataset: Dataset) -> list[tuple[Dataset, int]]:
+    """Return [(sub_dataset, global_offset)] for LeRobotDataset/MultiLeRobotDataset."""
+    if hasattr(dataset, "_datasets"):
+        subdatasets = []
+        offset = 0
+        for sub_ds in dataset._datasets:
+            subdatasets.append((sub_ds, offset))
+            offset += len(sub_ds.hf_dataset)
+        return subdatasets
+
+    if hasattr(dataset, "hf_dataset"):
+        return [(dataset, 0)]
+
+    raise TypeError(f"Unsupported dataset type for filtering: {type(dataset).__name__}")
+
+
+def _build_filtered_indices(dataset: Dataset, data_config: _config.DataConfig) -> list[int] | None:
+    if not (data_config.filter_success_only or data_config.filter_human_source or data_config.require_valid_frames):
+        return None
+
+    kept_indices: list[int] = []
+    total_frames = 0
+    excluded_invalid = 0
+    excluded_success = 0
+    excluded_source = 0
+
+    for sub_ds, offset in _iter_subdatasets(dataset):
+        n_frames = len(sub_ds.hf_dataset)
+        total_frames += n_frames
+
+        has_is_valid = "is_valid" in sub_ds.features
+        has_success = "success" in sub_ds.features
+        has_source = "source" in sub_ds.features
+
+        for local_idx in range(n_frames):
+            row = sub_ds.hf_dataset[local_idx]
+
+            if data_config.require_valid_frames and has_is_valid:
+                if _scalar_int(row["is_valid"]) == 0:
+                    excluded_invalid += 1
+                    continue
+
+            if data_config.filter_success_only and has_success:
+                if _scalar_int(row["success"]) != data_config.success_value:
+                    excluded_success += 1
+                    continue
+
+            if data_config.filter_human_source and has_source:
+                if _scalar_int(row["source"]) != data_config.source_human_value:
+                    excluded_source += 1
+                    continue
+
+            kept_indices.append(offset + local_idx)
+
+    logging.info(
+        "Filtered frame anchors: kept=%d/%d (excluded invalid=%d, success=%d, source=%d)",
+        len(kept_indices),
+        total_frames,
+        excluded_invalid,
+        excluded_success,
+        excluded_source,
+    )
+
+    return kept_indices
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
     """Create a dataset for training."""
-    repo_id = data_config.repo_id
-    if repo_id is None:
-        raise ValueError("Repo ID is not set. Cannot create dataset.")
-    if repo_id == "fake":
+    repo_ids = list(data_config.repo_ids)
+    if not repo_ids and data_config.repo_id is not None:
+        repo_ids = [data_config.repo_id]
+
+    if not repo_ids:
+        raise ValueError("Repo ID(s) are not set. Cannot create dataset.")
+    if len(repo_ids) == 1 and repo_ids[0] == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    primary_repo_id = repo_ids[0]
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(primary_repo_id)
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+
+    if len(repo_ids) == 1:
+        dataset = lerobot_dataset.LeRobotDataset(
+            primary_repo_id,
+            delta_timestamps=delta_timestamps,
+        )
+    else:
+        dataset = lerobot_dataset.MultiLeRobotDataset(
+            repo_ids=repo_ids,
+            delta_timestamps=delta_timestamps,
+        )
+        logging.info("Using MultiLeRobotDataset with repos: %s", ", ".join(repo_ids))
 
     if data_config.prompt_from_task:
+        if len(repo_ids) > 1:
+            logging.warning(
+                "prompt_from_task=True with multiple repos uses task mapping from first repo (%s).",
+                primary_repo_id,
+            )
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    filtered_indices = _build_filtered_indices(dataset, data_config)
+    if filtered_indices is not None:
+        if not filtered_indices:
+            raise ValueError("Filtering removed all frames. Check success/source/is_valid filter settings.")
+        dataset = IndexedDataset(dataset, filtered_indices)
 
     return dataset
 
@@ -172,7 +294,7 @@ def create_rlds_dataset(
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
+    if not _is_fake_data(data_config) and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "
@@ -200,7 +322,7 @@ def transform_iterable_dataset(
 ) -> IterableDataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
+    if not _is_fake_data(data_config) and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "

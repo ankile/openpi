@@ -29,8 +29,8 @@ def create_torch_dataloader(
     num_workers: int,
     max_frames: int | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
-    if data_config.repo_id is None:
-        raise ValueError("Data config must have a repo_id")
+    if data_config.repo_id is None and not data_config.repo_ids:
+        raise ValueError("Data config must have repo_id or repo_ids")
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
     dataset = _data_loader.TransformedDataset(
         dataset,
@@ -86,8 +86,11 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, max_frames: int | None = None, repo_ids: str | None = None):
     config = _config.get_config(config_name)
+    if repo_ids:
+        parsed_repo_ids = [r.strip() for r in repo_ids.split(",") if r.strip()]
+        config = _config.apply_repo_ids_override(config, parsed_repo_ids)
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.rlds_data_dir is not None:
@@ -108,7 +111,15 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    output_id = data_config.asset_id
+    if output_id is None:
+        if data_config.repo_id is not None:
+            output_id = data_config.repo_id
+        elif data_config.repo_ids:
+            output_id = data_config.repo_ids[0]
+        else:
+            output_id = "dataset"
+    output_path = config.assets_dirs / output_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

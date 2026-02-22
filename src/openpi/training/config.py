@@ -26,6 +26,7 @@ import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
+import openpi.training.sir_transforms as sir_transforms
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 
@@ -65,6 +66,8 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional list of LeRobot repo ids. If set, use these datasets in a single training run.
+    repo_ids: Sequence[str] = ()
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -89,6 +92,13 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # Frame-level filtering options for LeRobot datasets.
+    filter_success_only: bool = False
+    filter_human_source: bool = False
+    require_valid_frames: bool = False
+    success_value: int = 1
+    source_human_value: int = 1
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -167,6 +177,8 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
+    # Optional list of LeRobot repo ids.
+    repo_ids: Sequence[str] = ()
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -177,11 +189,17 @@ class DataConfigFactory(abc.ABC):
         """Create a data config."""
 
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repo_ids = tuple(dict.fromkeys(self.repo_ids))
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+        if repo_id is None and repo_ids:
+            repo_id = repo_ids[0]
+        if repo_id is not None and repo_ids and repo_id not in repo_ids:
+            repo_ids = (repo_id, *repo_ids)
         asset_id = self.assets.asset_id or repo_id
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
+            repo_ids=repo_ids,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -459,6 +477,50 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSIRDROIDDataConfig(DataConfigFactory):
+    """Data config for SIR real-world Franka datasets in LeRobot v3 format."""
+
+    exterior_image_keys: Sequence[str] = (
+        "observation.images.exterior_image_1_left",
+        "observation.images.25916956_left",
+    )
+    wrist_image_keys: Sequence[str] = (
+        "observation.images.wrist_image_left",
+        "observation.images.18650758_left",
+    )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                sir_transforms.SIRDroidRepackTransform(
+                    exterior_image_keys=self.exterior_image_keys,
+                    wrist_image_keys=self.wrist_image_keys,
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            outputs=[droid_policy.DroidOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            prompt_from_task=False,
+            action_sequence_keys=("action.joint_velocity", "action.gripper_position"),
+            filter_success_only=True,
+            filter_human_source=True,
+            require_valid_frames=True,
+            success_value=1,
+            source_human_value=1,
         )
 
 
@@ -916,6 +978,27 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=32,
     ),
+    TrainConfig(
+        # This config fine-tunes pi05 on SIR real-world Franka datasets (LeRobot v3 video-backed format).
+        name="pi05_sir_droid_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotSIRDROIDDataConfig(
+            repo_id="ankile/franka-insert-marker-single-v2",
+            base_config=DataConfig(prompt_from_task=False),
+            assets=AssetsConfig(
+                # Reuse DROID norm stats and pi05-droid initialization by default.
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
@@ -975,8 +1058,52 @@ if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
 
 
-def cli() -> TrainConfig:
-    return tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
+def _parse_repo_ids_arg(args: Sequence[str] | None) -> tuple[list[str] | None, list[str]]:
+    if args is None:
+        return None, []
+
+    repo_ids_override: list[str] | None = None
+    cleaned_args: list[str] = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--repo-ids":
+            if i + 1 >= len(args):
+                raise ValueError("--repo-ids requires a comma-separated value.")
+            raw = args[i + 1]
+            repo_ids_override = [r.strip() for r in raw.split(",") if r.strip()]
+            i += 2
+            continue
+        if arg.startswith("--repo-ids="):
+            raw = arg.split("=", 1)[1]
+            repo_ids_override = [r.strip() for r in raw.split(",") if r.strip()]
+            i += 1
+            continue
+        cleaned_args.append(arg)
+        i += 1
+
+    return repo_ids_override, cleaned_args
+
+
+def apply_repo_ids_override(config: TrainConfig, repo_ids: Sequence[str]) -> TrainConfig:
+    repo_ids = list(dict.fromkeys(r.strip() for r in repo_ids if r.strip()))
+    if not repo_ids:
+        raise ValueError("repo_ids override is empty after parsing.")
+    updated_data = dataclasses.replace(config.data, repo_id=repo_ids[0], repo_ids=tuple(repo_ids))
+    logging.info("Overriding dataset repos from CLI --repo-ids: %s", ", ".join(repo_ids))
+    return dataclasses.replace(config, data=updated_data)
+
+
+def cli(args: Sequence[str] | None = None) -> TrainConfig:
+    repo_ids_override, cleaned_args = _parse_repo_ids_arg(args)
+    config = tyro.extras.overridable_config_cli(
+        {k: (k, v) for k, v in _CONFIGS_DICT.items()},
+        args=cleaned_args if args is not None else None,
+    )
+    if repo_ids_override:
+        config = apply_repo_ids_override(config, repo_ids_override)
+    return config
 
 
 def get_config(config_name: str) -> TrainConfig:

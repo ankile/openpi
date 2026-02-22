@@ -82,3 +82,10 @@ def test_with_real_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+def test_apply_repo_ids_override():
+    config = _config.get_config("pi05_sir_droid_finetune")
+    updated = _config.apply_repo_ids_override(config, ["a/repo1", "b/repo2"])
+    assert updated.data.repo_id == "a/repo1"
+    assert list(updated.data.repo_ids) == ["a/repo1", "b/repo2"]

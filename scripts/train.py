@@ -2,6 +2,7 @@ import dataclasses
 import functools
 import logging
 import platform
+import sys
 from typing import Any
 
 import etils.epath as epath
@@ -277,4 +278,4 @@ def main(config: _config.TrainConfig):
 
 
 if __name__ == "__main__":
-    main(_config.cli())
+    main(_config.cli(sys.argv[1:]))
