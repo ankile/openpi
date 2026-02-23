@@ -981,6 +981,7 @@ _CONFIGS = [
     TrainConfig(
         # This config fine-tunes pi05 on SIR real-world Franka datasets (LeRobot v3 video-backed format).
         name="pi05_sir_droid_finetune",
+        project_name="franka-insert-marker",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
