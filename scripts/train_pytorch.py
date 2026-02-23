@@ -30,6 +30,7 @@ import os
 import platform
 import shutil
 import time
+from collections import defaultdict
 
 import jax
 import numpy as np
@@ -91,6 +92,34 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
 
+def get_slurm_job_info() -> dict[str, str | None] | None:
+    """Capture SLURM metadata from environment variables."""
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    slurm_array_job_id = os.environ.get("SLURM_ARRAY_JOB_ID")
+    slurm_array_task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+    slurm_job_name = os.environ.get("SLURM_JOB_NAME")
+    slurm_submit_dir = os.environ.get("SLURM_SUBMIT_DIR")
+
+    if not (slurm_job_id or slurm_array_job_id):
+        return None
+
+    log_file = None
+    if slurm_job_name and (slurm_job_id or slurm_array_job_id):
+        job_id_for_log = slurm_array_job_id or slurm_job_id
+        log_file = f"logs/{slurm_job_name}-{job_id_for_log}.out"
+        if slurm_submit_dir:
+            log_file = os.path.join(slurm_submit_dir, log_file)
+
+    return {
+        "job_id": slurm_job_id,
+        "array_job_id": slurm_array_job_id,
+        "array_task_id": slurm_array_task_id,
+        "job_name": slurm_job_name,
+        "submit_dir": slurm_submit_dir,
+        "log_file": log_file,
+    }
+
+
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
@@ -125,7 +154,7 @@ def set_seed(seed: int, local_rank: int):
 def build_datasets(config: _config.TrainConfig):
     # Use the unified data loader with PyTorch framework
     data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
-    return data_loader, data_loader.data_config()
+    return data_loader, data_loader.data_config(), data_loader.data_stats()
 
 
 def get_model_state_dict(model):
@@ -191,7 +220,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
 
         # Log checkpoint to wandb
         if config.wandb_enabled:
-            wandb.log({"checkpoint_step": global_step}, step=global_step)
+            wandb.log({"train/checkpoint_step": global_step}, step=global_step)
 
 
 def load_checkpoint(model, optimizer, checkpoint_dir, device):
@@ -345,6 +374,7 @@ def train_loop(config: _config.TrainConfig):
     # Initialize wandb (only on main process)
     if is_main:
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    slurm_info = get_slurm_job_info()
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
@@ -356,7 +386,14 @@ def train_loop(config: _config.TrainConfig):
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
-    loader, data_config = build_datasets(config)
+    loader, data_config, dataset_stats = build_datasets(config)
+    if is_main and config.wandb_enabled:
+        if slurm_info is not None:
+            wandb.config.update({"slurm": slurm_info}, allow_val_change=True)
+            wandb.run.summary["slurm"] = slurm_info
+        if dataset_stats is not None:
+            wandb.config.update({"dataset": dataset_stats}, allow_val_change=True)
+            wandb.run.summary["dataset_data"] = dataset_stats
 
     # Log sample images to wandb on first batch
     if is_main and config.wandb_enabled and not resuming:
@@ -480,7 +517,9 @@ def train_loop(config: _config.TrainConfig):
         return end_lr + (peak_lr - end_lr) * cos
 
     model.train()
-    start_time = time.time()
+    train_start_time = time.time()
+    interval_start_time = train_start_time
+    cumulative_timings = defaultdict(float)
     infos = []  # Collect stats over log interval
     if is_main:
         logging.info(
@@ -498,6 +537,18 @@ def train_loop(config: _config.TrainConfig):
         )
         logging.info("EMA is not supported for PyTorch training")
         logging.info(f"Training precision: {model_cfg.dtype}")
+        if config.wandb_enabled and dataset_stats is not None:
+            wandb.log(
+                {
+                    "dataset/training_frames": dataset_stats["training_frames"],
+                    "dataset/total_frames": dataset_stats["total_frames"],
+                    "dataset/filtered_frames": dataset_stats["filtered_frames"],
+                    "dataset/filter_success_only": int(dataset_stats["filter_success_only"]),
+                    "dataset/filter_human_source": int(dataset_stats["filter_human_source"]),
+                    "dataset/require_valid_frames": int(dataset_stats["require_valid_frames"]),
+                },
+                step=global_step,
+            )
 
     # Training loop - iterate until we reach num_train_steps
     pbar = (
@@ -516,6 +567,7 @@ def train_loop(config: _config.TrainConfig):
             if global_step >= config.num_train_steps:
                 break
 
+            step_start = time.perf_counter()
             # The unified data loader returns (observation, actions) tuple
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
@@ -526,17 +578,21 @@ def train_loop(config: _config.TrainConfig):
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass
+            forward_start = time.perf_counter()
             losses = model(observation, actions)
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
             elif not isinstance(losses, torch.Tensor):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            cumulative_timings["forward"] += time.perf_counter() - forward_start
 
             loss = losses.mean()
 
             # Backward pass
+            backward_start = time.perf_counter()
             loss.backward()
+            cumulative_timings["backward"] += time.perf_counter() - backward_start
 
             # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():
@@ -546,14 +602,17 @@ def train_loop(config: _config.TrainConfig):
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
 
             # Optimizer step
+            optimizer_start = time.perf_counter()
             optim.step()
             optim.zero_grad(set_to_none=True)
+            cumulative_timings["optimizer"] += time.perf_counter() - optimizer_start
 
             # Clear gradients more aggressively
             for param in model.parameters():
                 if param.grad is not None:
                     param.grad.detach_()
                     param.grad = None
+            cumulative_timings["train_step"] += time.perf_counter() - step_start
 
             # Collect stats
             if is_main:
@@ -566,7 +625,8 @@ def train_loop(config: _config.TrainConfig):
                 )
 
             if is_main and (global_step % config.log_interval == 0):
-                elapsed = time.time() - start_time
+                interval_elapsed = time.time() - interval_start_time
+                elapsed_total = time.time() - train_start_time
 
                 # Average stats over log interval
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
@@ -580,29 +640,41 @@ def train_loop(config: _config.TrainConfig):
                     if len(vals) > 0:
                         avg_grad_norm = sum(vals) / len(vals)
                 logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
+                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={interval_elapsed:.1f}s"
                     if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={interval_elapsed:.1f}s"
                 )
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
+                    total_cumulative_time = sum(cumulative_timings.values())
                     log_payload = {
-                        "loss": avg_loss,
-                        "learning_rate": avg_lr,
-                        "step": global_step,
-                        "time_per_step": elapsed / config.log_interval,
+                        "train/loss": avg_loss,
+                        "train/lr": avg_lr,
+                        "timing/step_time_ms": (interval_elapsed / max(1, len(infos))) * 1000,
+                        "timing/elapsed_hours": elapsed_total / 3600,
+                        "timing_cumulative/total_hours": total_cumulative_time / 3600,
                     }
                     if avg_grad_norm is not None:
-                        log_payload["grad_norm"] = avg_grad_norm
+                        log_payload["train/grad_norm"] = avg_grad_norm
+                    remaining_steps = max(0, config.num_train_steps - global_step)
+                    log_payload["timing/eta_hours"] = (
+                        (interval_elapsed / max(1, len(infos))) * remaining_steps / 3600
+                    )
+                    for key, total_time in cumulative_timings.items():
+                        log_payload[f"timing_cumulative/hours_{key}"] = total_time / 3600
+                        if total_cumulative_time > 0:
+                            log_payload[f"timing_cumulative/share_{key}"] = total_time / total_cumulative_time
                     wandb.log(log_payload, step=global_step)
 
-                start_time = time.time()
+                interval_start_time = time.time()
                 infos = []  # Reset stats collection
 
             global_step += 1
             # Save checkpoint using the new mechanism
+            checkpoint_start = time.perf_counter()
             save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            cumulative_timings["checkpoint"] += time.perf_counter() - checkpoint_start
 
             # Update progress bar
             if pbar is not None:

@@ -50,6 +50,10 @@ class DataLoader(Protocol[T_co]):
         """Get the data config for this data loader."""
         raise NotImplementedError("Subclasses of DataLoader should implement data_config.")
 
+    def data_stats(self) -> dict[str, typing.Any] | None:
+        """Get dataset/filtering stats for this data loader."""
+        raise NotImplementedError("Subclasses of DataLoader should implement data_stats.")
+
     def __iter__(self) -> Iterator[T_co]:
         raise NotImplementedError("Subclasses of DataLoader should implement __iter__.")
 
@@ -159,6 +163,13 @@ def _is_fake_data(data_config: _config.DataConfig) -> bool:
     return len(data_config.repo_ids) == 1 and data_config.repo_ids[0] == "fake"
 
 
+def _resolve_repo_ids(data_config: _config.DataConfig) -> list[str]:
+    repo_ids = list(data_config.repo_ids)
+    if not repo_ids and data_config.repo_id is not None:
+        repo_ids = [data_config.repo_id]
+    return repo_ids
+
+
 def _iter_subdatasets(dataset: Dataset) -> list[tuple[Dataset, int]]:
     """Return [(sub_dataset, global_offset)] for LeRobotDataset/MultiLeRobotDataset."""
     if hasattr(dataset, "_datasets"):
@@ -175,9 +186,26 @@ def _iter_subdatasets(dataset: Dataset) -> list[tuple[Dataset, int]]:
     raise TypeError(f"Unsupported dataset type for filtering: {type(dataset).__name__}")
 
 
-def _build_filtered_indices(dataset: Dataset, data_config: _config.DataConfig) -> list[int] | None:
-    if not (data_config.filter_success_only or data_config.filter_human_source or data_config.require_valid_frames):
-        return None
+def _build_filtered_indices(
+    dataset: Dataset, data_config: _config.DataConfig
+) -> tuple[list[int] | None, dict[str, typing.Any]]:
+    filtering_enabled = data_config.filter_success_only or data_config.filter_human_source or data_config.require_valid_frames
+
+    if not filtering_enabled:
+        total_frames = 0
+        for sub_ds, _ in _iter_subdatasets(dataset):
+            total_frames += len(sub_ds.hf_dataset)
+        return None, {
+            "filter_success_only": data_config.filter_success_only,
+            "filter_human_source": data_config.filter_human_source,
+            "require_valid_frames": data_config.require_valid_frames,
+            "total_frames": total_frames,
+            "training_frames": total_frames,
+            "filtered_frames": 0,
+            "excluded_invalid_frames": 0,
+            "excluded_success_frames": 0,
+            "excluded_source_frames": 0,
+        }
 
     kept_indices: list[int] = []
     total_frames = 0
@@ -213,6 +241,18 @@ def _build_filtered_indices(dataset: Dataset, data_config: _config.DataConfig) -
 
             kept_indices.append(offset + local_idx)
 
+    stats = {
+        "filter_success_only": data_config.filter_success_only,
+        "filter_human_source": data_config.filter_human_source,
+        "require_valid_frames": data_config.require_valid_frames,
+        "total_frames": total_frames,
+        "training_frames": len(kept_indices),
+        "filtered_frames": total_frames - len(kept_indices),
+        "excluded_invalid_frames": excluded_invalid,
+        "excluded_success_frames": excluded_success,
+        "excluded_source_frames": excluded_source,
+    }
+
     logging.info(
         "Filtered frame anchors: kept=%d/%d (excluded invalid=%d, success=%d, source=%d)",
         len(kept_indices),
@@ -222,21 +262,33 @@ def _build_filtered_indices(dataset: Dataset, data_config: _config.DataConfig) -
         excluded_source,
     )
 
-    return kept_indices
+    return kept_indices, stats
 
 
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
-) -> Dataset:
+) -> tuple[Dataset, dict[str, typing.Any]]:
     """Create a dataset for training."""
-    repo_ids = list(data_config.repo_ids)
-    if not repo_ids and data_config.repo_id is not None:
-        repo_ids = [data_config.repo_id]
+    repo_ids = _resolve_repo_ids(data_config)
 
     if not repo_ids:
         raise ValueError("Repo ID(s) are not set. Cannot create dataset.")
     if len(repo_ids) == 1 and repo_ids[0] == "fake":
-        return FakeDataset(model_config, num_samples=1024)
+        return (
+            FakeDataset(model_config, num_samples=1024),
+            {
+                "repo_ids": repo_ids,
+                "filter_success_only": data_config.filter_success_only,
+                "filter_human_source": data_config.filter_human_source,
+                "require_valid_frames": data_config.require_valid_frames,
+                "total_frames": 1024,
+                "training_frames": 1024,
+                "filtered_frames": 0,
+                "excluded_invalid_frames": 0,
+                "excluded_success_frames": 0,
+                "excluded_source_frames": 0,
+            },
+        )
 
     primary_repo_id = repo_ids[0]
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(primary_repo_id)
@@ -264,13 +316,14 @@ def create_torch_dataset(
             )
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
-    filtered_indices = _build_filtered_indices(dataset, data_config)
+    filtered_indices, stats = _build_filtered_indices(dataset, data_config)
     if filtered_indices is not None:
         if not filtered_indices:
             raise ValueError("Filtering removed all frames. Check success/source/is_valid filter settings.")
         dataset = IndexedDataset(dataset, filtered_indices)
 
-    return dataset
+    stats["repo_ids"] = repo_ids
+    return dataset, stats
 
 
 def create_rlds_dataset(
@@ -421,7 +474,7 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    dataset, data_stats = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
@@ -456,7 +509,7 @@ def create_torch_data_loader(
         framework=framework,
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoaderImpl(data_config, data_loader, data_stats=data_stats)
 
 
 def create_rlds_data_loader(
@@ -497,7 +550,7 @@ def create_rlds_data_loader(
         num_batches=num_batches,
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoaderImpl(data_config, data_loader, data_stats=None)
 
 
 class TorchDataLoader:
@@ -650,12 +703,22 @@ class RLDSDataLoader:
 
 
 class DataLoaderImpl(DataLoader):
-    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader):
+    def __init__(
+        self,
+        data_config: _config.DataConfig,
+        data_loader: TorchDataLoader | RLDSDataLoader,
+        *,
+        data_stats: dict[str, typing.Any] | None,
+    ):
         self._data_config = data_config
         self._data_loader = data_loader
+        self._data_stats = data_stats
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
+
+    def data_stats(self) -> dict[str, typing.Any] | None:
+        return self._data_stats
 
     def __iter__(self):
         for batch in self._data_loader:

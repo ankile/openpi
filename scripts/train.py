@@ -1,8 +1,11 @@
 import dataclasses
 import functools
+import os
 import logging
 import platform
 import sys
+import time
+from collections import defaultdict
 from typing import Any
 
 import etils.epath as epath
@@ -69,6 +72,34 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
+
+
+def get_slurm_job_info() -> dict[str, str | None] | None:
+    """Capture SLURM metadata from environment variables."""
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    slurm_array_job_id = os.environ.get("SLURM_ARRAY_JOB_ID")
+    slurm_array_task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+    slurm_job_name = os.environ.get("SLURM_JOB_NAME")
+    slurm_submit_dir = os.environ.get("SLURM_SUBMIT_DIR")
+
+    if not (slurm_job_id or slurm_array_job_id):
+        return None
+
+    log_file = None
+    if slurm_job_name and (slurm_job_id or slurm_array_job_id):
+        job_id_for_log = slurm_array_job_id or slurm_job_id
+        log_file = f"logs/{slurm_job_name}-{job_id_for_log}.out"
+        if slurm_submit_dir:
+            log_file = str(epath.Path(slurm_submit_dir) / log_file)
+
+    return {
+        "job_id": slurm_job_id,
+        "array_job_id": slurm_array_job_id,
+        "array_task_id": slurm_array_task_id,
+        "job_name": slurm_job_name,
+        "submit_dir": slurm_submit_dir,
+        "log_file": log_file,
+    }
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -217,12 +248,21 @@ def main(config: _config.TrainConfig):
         resume=config.resume,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    slurm_info = get_slurm_job_info()
 
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
         shuffle=True,
     )
+    dataset_stats = data_loader.data_stats()
+    if config.wandb_enabled:
+        if slurm_info is not None:
+            wandb.config.update({"slurm": slurm_info}, allow_val_change=True)
+            wandb.run.summary["slurm"] = slurm_info
+        if dataset_stats is not None:
+            wandb.config.update({"dataset": dataset_stats}, allow_val_change=True)
+            wandb.run.summary["dataset_data"] = dataset_stats
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
@@ -249,6 +289,19 @@ def main(config: _config.TrainConfig):
     )
 
     start_step = int(train_state.step)
+    if config.wandb_enabled and dataset_stats is not None:
+        wandb.log(
+            {
+                "dataset/training_frames": dataset_stats["training_frames"],
+                "dataset/total_frames": dataset_stats["total_frames"],
+                "dataset/filtered_frames": dataset_stats["filtered_frames"],
+                "dataset/filter_success_only": int(dataset_stats["filter_success_only"]),
+                "dataset/filter_human_source": int(dataset_stats["filter_human_source"]),
+                "dataset/require_valid_frames": int(dataset_stats["require_valid_frames"]),
+            },
+            step=start_step,
+        )
+
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
@@ -256,22 +309,65 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
+    lr_schedule_fn = config.lr_schedule.create()
     infos = []
+    cumulative_timings = defaultdict(float)
+    train_start_time = time.perf_counter()
+    log_interval_start_time = train_start_time
     for step in pbar:
+        train_step_start = time.perf_counter()
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
+        cumulative_timings["train_step"] += time.perf_counter() - train_step_start
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+
+            now = time.perf_counter()
+            interval_elapsed = now - log_interval_start_time
+            steps_in_interval = max(1, len(infos))
+            avg_step_time = interval_elapsed / steps_in_interval
+            elapsed_total = now - train_start_time
+            remaining_steps = max(0, config.num_train_steps - (step + 1))
+            eta_seconds = remaining_steps * avg_step_time
+            total_cumulative_time = sum(cumulative_timings.values())
+
+            info_str = (
+                f"train/loss={float(reduced_info['loss']):.4f}, "
+                f"train/grad_norm={float(reduced_info['grad_norm']):.4f}, "
+                f"train/lr={float(jax.device_get(lr_schedule_fn(step))):.2e}"
+            )
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+
+            log_payload = {
+                "train/loss": float(reduced_info["loss"]),
+                "train/grad_norm": float(reduced_info["grad_norm"]),
+                "train/lr": float(jax.device_get(lr_schedule_fn(step))),
+                "timing/elapsed_hours": elapsed_total / 3600,
+                "timing/eta_hours": eta_seconds / 3600,
+                "timing/step_time_ms": avg_step_time * 1000,
+                "timing_cumulative/total_hours": total_cumulative_time / 3600,
+            }
+            if "param_norm" in reduced_info:
+                log_payload["train/param_norm"] = float(reduced_info["param_norm"])
+            for key, total_time in cumulative_timings.items():
+                log_payload[f"timing_cumulative/hours_{key}"] = total_time / 3600
+                if total_cumulative_time > 0:
+                    log_payload[f"timing_cumulative/share_{key}"] = total_time / total_cumulative_time
+
+            wandb.log(log_payload, step=step)
             infos = []
+            log_interval_start_time = time.perf_counter()
+
+        data_loading_start = time.perf_counter()
         batch = next(data_iter)
+        cumulative_timings["data_loading"] += time.perf_counter() - data_loading_start
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+            checkpoint_start = time.perf_counter()
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            cumulative_timings["checkpoint"] += time.perf_counter() - checkpoint_start
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
