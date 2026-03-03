@@ -37,6 +37,10 @@ dependencies = [
     "transformers==4.53.2",
     "rich>=14.0.0",
     "polars>=1.30.0",
+    # Robot workstation deps (SpaceMouse + arena client)
+    "hidapi>=0.14.0",
+    "easyhid>=0.0.10",
+    "policy-arena>=0.1.0",
 ]
 
 
@@ -56,11 +60,17 @@ dev = [
 rlds = []
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+override-dependencies = [
+    "ml-dtypes==0.4.1",
+    "tensorstore==0.1.74",
+    # pyzed (ZED camera SDK) was compiled against numpy 1.x ABI
+    "numpy>=1.26.4,<2",
+]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }
 lerobot = { path = "../lerobot", editable = true }
+policy-arena = { path = "../../../policy-arena/python", editable = true }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
 
 [tool.uv.workspace]
