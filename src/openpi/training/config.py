@@ -493,6 +493,9 @@ class LeRobotSIRDROIDDataConfig(DataConfigFactory):
         "observation.images.wrist_image_left",
         "observation.images.18650758_left",
     )
+    # Fixed natural-language instruction injected as the prompt (datasets carry only
+    # the task slug, which we no longer use — see SIRDroidRepackTransform).
+    default_prompt: str | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -508,7 +511,7 @@ class LeRobotSIRDROIDDataConfig(DataConfigFactory):
             inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
             outputs=[droid_policy.DroidOutputs()],
         )
-        model_transforms = ModelTransformFactory()(model_config)
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -991,6 +994,7 @@ _CONFIGS = [
         data=LeRobotSIRDROIDDataConfig(
             repo_id="ankile/franka-insert-marker-single-v2",
             base_config=DataConfig(prompt_from_task=False),
+            default_prompt="pick up the white marker and insert it into the black holder",
             assets=AssetsConfig(
                 # Reuse DROID norm stats and pi05-droid initialization by default.
                 assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
@@ -1013,6 +1017,7 @@ _CONFIGS = [
         data=LeRobotSIRDROIDDataConfig(
             repo_id="ankile/franka-insert-marker-single-v2",
             base_config=DataConfig(prompt_from_task=False),
+            default_prompt="pick up the white marker and insert it into the black holder",
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
                 asset_id="droid",

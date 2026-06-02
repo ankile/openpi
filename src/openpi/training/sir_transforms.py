@@ -41,7 +41,9 @@ class SIRDroidRepackTransform(transforms.DataTransformFn):
     gripper_position_key: str = "observation.state.gripper_position"
     action_joint_velocity_key: str = "action.joint_velocity"
     action_gripper_position_key: str = "action.gripper_position"
-    prompt_keys: Sequence[str] = ("prompt", "task")
+    # Only honor an explicit "prompt" — do NOT fall back to the LeRobot "task"
+    # slug, so the config's default_prompt (a real instruction) is used instead.
+    prompt_keys: Sequence[str] = ("prompt",)
 
     def __call__(self, data: dict) -> dict:
         out = {
