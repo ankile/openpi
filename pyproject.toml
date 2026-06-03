@@ -34,7 +34,7 @@ dependencies = [
     "filelock>=3.16.1",
     "beartype==0.19.0",
     "treescope>=0.1.7",
-    "transformers==4.53.2",
+    "transformers>=4.57.6,<5.0.0",  # SIR: bumped from ==4.53.2 so this env can also load
     "rich>=14.0.0",
     "polars>=1.30.0",
     # Robot workstation deps (SpaceMouse + arena client)
