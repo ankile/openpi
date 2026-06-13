@@ -134,3 +134,87 @@ def test_build_filtered_indices_stats():
     assert stats["excluded_success_frames"] == 1
     assert stats["excluded_source_frames"] == 1
     assert stats["excluded_invalid_frames"] == 1
+
+
+def test_compute_nonidle_keep_mask_matches_droid_semantics():
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    dof = 7
+    # Episode layout: 30 moving, 10 idle (>= min_idle_len -> dropped),
+    # 40 moving, 3 idle (< min_idle_len -> kept), 27 moving.
+    moving_a = rng.uniform(-0.5, 0.5, size=(30, dof))
+    idle_long = np.tile(rng.uniform(-0.5, 0.5, size=(1, dof)), (10, 1))
+    moving_b = rng.uniform(-0.5, 0.5, size=(40, dof))
+    idle_short = np.tile(rng.uniform(-0.5, 0.5, size=(1, dof)), (3, 1))
+    moving_c = rng.uniform(-0.5, 0.5, size=(27, dof))
+    jv = np.concatenate([moving_a, idle_long, moving_b, idle_short, moving_c])
+
+    mask = _data_loader._compute_nonidle_keep_mask(
+        jv,
+        idle_action_threshold=1e-3,
+        min_idle_len=7,
+        min_non_idle_len=16,
+        filter_last_n_in_ranges=10,
+    )
+
+    # Idle frames are flagged on the diff, so the long idle run covers frames 31..39
+    # (frame 30 differs from 29). Kept ranges before tail-trim: [0, 31) and [40, 110)
+    # (the 3-frame idle run at 70+3.. is shorter than min_idle_len so it survives).
+    expected = np.zeros(len(jv), dtype=bool)
+    expected[0 : 31 - 10] = True
+    expected[40 : 110 - 10] = True
+    assert mask.tolist() == expected.tolist()
+
+    # An all-idle episode keeps nothing.
+    all_idle = np.tile(jv[:1], (50, 1))
+    mask_idle = _data_loader._compute_nonidle_keep_mask(
+        all_idle,
+        idle_action_threshold=1e-3,
+        min_idle_len=7,
+        min_non_idle_len=16,
+        filter_last_n_in_ranges=10,
+    )
+    assert not mask_idle.any()
+
+
+class _TinyIdleDataset:
+    def __init__(self):
+        import numpy as np
+
+        rng = np.random.default_rng(1)
+        self.repo_id = "test/tiny-idle"
+        self.features = {"action.joint_velocity": {}, "episode_index": {}, "frame_index": {}}
+        self.hf_dataset = []
+        for episode_index in range(2):
+            moving = rng.uniform(-0.5, 0.5, size=(30, 7))
+            idle = np.tile(rng.uniform(-0.5, 0.5, size=(1, 7)), (10, 1))
+            jv = np.concatenate([moving, idle, rng.uniform(-0.5, 0.5, size=(20, 7))])
+            for frame_index in range(len(jv)):
+                self.hf_dataset.append(
+                    {
+                        "episode_index": episode_index,
+                        "frame_index": frame_index,
+                        "action.joint_velocity": jv[frame_index],
+                    }
+                )
+
+    def __getitem__(self, index):
+        return self.hf_dataset[index]
+
+    def __len__(self):
+        return len(self.hf_dataset)
+
+
+def test_build_filtered_indices_idle_filter():
+    dataset = _TinyIdleDataset()
+    config = _config.DataConfig(filter_idle_frames=True)
+
+    indices, stats = _data_loader._build_filtered_indices(dataset, config)
+    assert stats["total_frames"] == 120
+    assert stats["excluded_idle_frames"] > 0
+    assert stats["training_frames"] == len(indices)
+    assert stats["training_frames"] + stats["excluded_idle_frames"] == 120
+    # Per-episode: frames 31..39 idle-dropped, ranges [0,31) and [40,60) tail-trimmed by 10.
+    per_episode_kept = 21 + 10
+    assert stats["training_frames"] == 2 * per_episode_kept

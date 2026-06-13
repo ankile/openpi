@@ -186,10 +186,107 @@ def _iter_subdatasets(dataset: Dataset) -> list[tuple[Dataset, int]]:
     raise TypeError(f"Unsupported dataset type for filtering: {type(dataset).__name__}")
 
 
+def _compute_nonidle_keep_mask(
+    joint_velocities: np.ndarray,
+    *,
+    idle_action_threshold: float,
+    min_idle_len: int,
+    min_non_idle_len: int,
+    filter_last_n_in_ranges: int,
+) -> np.ndarray:
+    """Per-episode port of examples/droid/compute_droid_nonidle_ranges.py.
+
+    A frame t (t >= 1) is idle when all |joint_velocity[t] - joint_velocity[t-1]| are
+    below ``idle_action_threshold``. Idle runs of length >= ``min_idle_len`` are dropped,
+    surviving non-idle runs shorter than ``min_non_idle_len`` are dropped, and the last
+    ``filter_last_n_in_ranges`` frames of each kept range are trimmed (their action
+    chunks consist mostly of idle actions). Returns a boolean keep-mask over frames.
+    """
+    joint_velocities = np.asarray(joint_velocities)
+    if joint_velocities.ndim != 2:
+        raise ValueError(f"Expected (T, dof) joint velocities, got shape {joint_velocities.shape}")
+    n_frames = len(joint_velocities)
+
+    is_idle_array = np.hstack(
+        [
+            np.array([False]),
+            np.all(np.abs(joint_velocities[1:] - joint_velocities[:-1]) < idle_action_threshold, axis=1),
+        ]
+    )
+
+    # Find what steps go from idle to non-idle and vice-versa.
+    is_idle_padded = np.concatenate([[False], is_idle_array, [False]])
+    is_idle_diff = np.diff(is_idle_padded.astype(int))
+    is_idle_true_starts = np.where(is_idle_diff == 1)[0]
+    is_idle_true_ends = np.where(is_idle_diff == -1)[0]
+
+    # Drop idle segments of length at least min_idle_len.
+    true_segment_masks = (is_idle_true_ends - is_idle_true_starts) >= min_idle_len
+    is_idle_true_starts = is_idle_true_starts[true_segment_masks]
+    is_idle_true_ends = is_idle_true_ends[true_segment_masks]
+
+    keep_mask = np.ones(n_frames, dtype=bool)
+    for start, end in zip(is_idle_true_starts, is_idle_true_ends, strict=True):
+        keep_mask[start:end] = False
+
+    # Keep only non-idle ranges of length at least min_non_idle_len, trimming range tails.
+    keep_padded = np.concatenate([[False], keep_mask, [False]])
+    keep_diff = np.diff(keep_padded.astype(int))
+    keep_true_starts = np.where(keep_diff == 1)[0]
+    keep_true_ends = np.where(keep_diff == -1)[0]
+
+    true_segment_masks = (keep_true_ends - keep_true_starts) >= min_non_idle_len
+    keep_true_starts = keep_true_starts[true_segment_masks]
+    keep_true_ends = keep_true_ends[true_segment_masks]
+
+    final_mask = np.zeros(n_frames, dtype=bool)
+    for start, end in zip(keep_true_starts, keep_true_ends, strict=True):
+        final_mask[start : max(start, end - filter_last_n_in_ranges)] = True
+    return final_mask
+
+
+def _build_idle_keep_mask(sub_ds: Dataset, data_config: _config.DataConfig) -> np.ndarray:
+    """Boolean keep-mask over a sub-dataset's frame anchors, dropping idle frames."""
+    hf_dataset = sub_ds.hf_dataset
+    jv_key = data_config.idle_joint_velocity_key
+    if jv_key not in sub_ds.features:
+        raise ValueError(
+            f"filter_idle_frames=True requires the '{jv_key}' feature, "
+            f"but it is missing from dataset {getattr(sub_ds, 'repo_id', '?')}."
+        )
+
+    episodes: dict[int, list[tuple[int, int, np.ndarray]]] = {}
+    for local_idx in range(len(hf_dataset)):
+        row = hf_dataset[local_idx]
+        episode_index = _scalar_int(row["episode_index"])
+        frame_index = _scalar_int(row["frame_index"])
+        joint_velocity = np.asarray(row[jv_key], dtype=np.float32)
+        episodes.setdefault(episode_index, []).append((frame_index, local_idx, joint_velocity))
+
+    keep = np.zeros(len(hf_dataset), dtype=bool)
+    for items in episodes.values():
+        items.sort(key=lambda item: item[0])
+        episode_mask = _compute_nonidle_keep_mask(
+            np.stack([item[2] for item in items]),
+            idle_action_threshold=data_config.idle_action_threshold,
+            min_idle_len=data_config.idle_min_idle_len,
+            min_non_idle_len=data_config.idle_min_non_idle_len,
+            filter_last_n_in_ranges=data_config.idle_filter_last_n_in_ranges,
+        )
+        for (_, local_idx, _), keep_frame in zip(items, episode_mask, strict=True):
+            keep[local_idx] = keep_frame
+    return keep
+
+
 def _build_filtered_indices(
     dataset: Dataset, data_config: _config.DataConfig
 ) -> tuple[list[int] | None, dict[str, typing.Any]]:
-    filtering_enabled = data_config.filter_success_only or data_config.filter_human_source or data_config.require_valid_frames
+    filtering_enabled = (
+        data_config.filter_success_only
+        or data_config.filter_human_source
+        or data_config.require_valid_frames
+        or data_config.filter_idle_frames
+    )
 
     if not filtering_enabled:
         total_frames = 0
@@ -199,12 +296,14 @@ def _build_filtered_indices(
             "filter_success_only": data_config.filter_success_only,
             "filter_human_source": data_config.filter_human_source,
             "require_valid_frames": data_config.require_valid_frames,
+            "filter_idle_frames": data_config.filter_idle_frames,
             "total_frames": total_frames,
             "training_frames": total_frames,
             "filtered_frames": 0,
             "excluded_invalid_frames": 0,
             "excluded_success_frames": 0,
             "excluded_source_frames": 0,
+            "excluded_idle_frames": 0,
         }
 
     kept_indices: list[int] = []
@@ -212,6 +311,7 @@ def _build_filtered_indices(
     excluded_invalid = 0
     excluded_success = 0
     excluded_source = 0
+    excluded_idle = 0
 
     for sub_ds, offset in _iter_subdatasets(dataset):
         n_frames = len(sub_ds.hf_dataset)
@@ -220,6 +320,8 @@ def _build_filtered_indices(
         has_is_valid = "is_valid" in sub_ds.features
         has_success = "success" in sub_ds.features
         has_source = "source" in sub_ds.features
+
+        idle_keep = _build_idle_keep_mask(sub_ds, data_config) if data_config.filter_idle_frames else None
 
         for local_idx in range(n_frames):
             row = sub_ds.hf_dataset[local_idx]
@@ -239,27 +341,37 @@ def _build_filtered_indices(
                     excluded_source += 1
                     continue
 
+            if idle_keep is not None and not idle_keep[local_idx]:
+                excluded_idle += 1
+                continue
+
             kept_indices.append(offset + local_idx)
 
     stats = {
         "filter_success_only": data_config.filter_success_only,
         "filter_human_source": data_config.filter_human_source,
         "require_valid_frames": data_config.require_valid_frames,
+        "filter_idle_frames": data_config.filter_idle_frames,
         "total_frames": total_frames,
         "training_frames": len(kept_indices),
         "filtered_frames": total_frames - len(kept_indices),
         "excluded_invalid_frames": excluded_invalid,
         "excluded_success_frames": excluded_success,
         "excluded_source_frames": excluded_source,
+        "excluded_idle_frames": excluded_idle,
     }
 
+    if len(kept_indices) == 0:
+        raise ValueError(f"All frame anchors were filtered out; refusing to train on an empty dataset. Stats: {stats}")
+
     logging.info(
-        "Filtered frame anchors: kept=%d/%d (excluded invalid=%d, success=%d, source=%d)",
+        "Filtered frame anchors: kept=%d/%d (excluded invalid=%d, success=%d, source=%d, idle=%d)",
         len(kept_indices),
         total_frames,
         excluded_invalid,
         excluded_success,
         excluded_source,
+        excluded_idle,
     )
 
     return kept_indices, stats

@@ -101,6 +101,20 @@ class DataConfig:
     success_value: int = 1
     source_human_value: int = 1
 
+    # Idle-frame filtering for LeRobot datasets. Ports the DROID non-idle range filter
+    # (examples/droid/compute_droid_nonidle_ranges.py, used to build
+    # gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json) to LeRobot frame anchors:
+    # a frame is idle when all |joint_velocity[t] - joint_velocity[t-1]| < threshold;
+    # idle runs of length >= idle_min_idle_len are dropped, surviving non-idle runs shorter
+    # than idle_min_non_idle_len are dropped, and the last idle_filter_last_n_in_ranges
+    # frames of each kept range are trimmed (their action chunks are mostly idle actions).
+    filter_idle_frames: bool = False
+    idle_joint_velocity_key: str = "action.joint_velocity"
+    idle_action_threshold: float = 1e-3
+    idle_min_idle_len: int = 7
+    idle_min_non_idle_len: int = 16
+    idle_filter_last_n_in_ranges: int = 10
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -496,6 +510,9 @@ class LeRobotSIRDROIDDataConfig(DataConfigFactory):
     # Fixed natural-language instruction injected as the prompt (datasets carry only
     # the task slug, which we no longer use — see SIRDroidRepackTransform).
     default_prompt: str | None = None
+    # If true, drop idle frame anchors (DROID non-idle range filter ported to LeRobot;
+    # see DataConfig.filter_idle_frames).
+    filter_idle_frames: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -525,6 +542,7 @@ class LeRobotSIRDROIDDataConfig(DataConfigFactory):
             require_valid_frames=True,
             success_value=1,
             source_human_value=1,
+            filter_idle_frames=self.filter_idle_frames,
         )
 
 
@@ -1000,6 +1018,31 @@ _CONFIGS = [
                 assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
                 asset_id="droid",
             ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        # Same as pi05_sir_droid_finetune, but with the DROID idle-frame filter enabled
+        # (drop frame anchors inside long idle runs; see DataConfig.filter_idle_frames).
+        name="pi05_sir_droid_finetune_idle",
+        project_name="franka-insert-marker",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotSIRDROIDDataConfig(
+            repo_id="ankile/franka-insert-marker-single-v2",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="pick up the white marker and insert it into the black holder",
+            assets=AssetsConfig(
+                # Reuse DROID norm stats and pi05-droid initialization by default.
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+            filter_idle_frames=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
