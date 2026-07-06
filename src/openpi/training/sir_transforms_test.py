@@ -124,6 +124,24 @@ def test_routing_3cam_config_resolves_and_builds_data_config(tmp_path):
     assert data_config.action_sequence_keys == ("action.joint_velocity", "action.gripper_position")
     assert data_config.filter_idle_frames is True
 
+    # Run the CONFIG-created repack (not a hand-built transform) on a role-keyed sample:
+    # the factory passes its OWN exterior/wrist key fields into the repack, so role keys
+    # missing from the config defaults fail at train time even when the transform's
+    # defaults list them (exactly how jobs 16091463/64 died).
+    repack = data_config.repack_transforms.inputs[0]
+    out = repack(
+        {
+            "observation.images.side_1": np.zeros((3, 64, 64), dtype=np.float32),
+            "observation.images.wrist_left": np.ones((3, 64, 64), dtype=np.float32),
+            "observation.images.side_2": np.full((3, 64, 64), 0.5, dtype=np.float32),
+            "observation.state.joint_position": np.zeros((7,), dtype=np.float32),
+            "observation.state.gripper_position": np.array([0.1], dtype=np.float32),
+        }
+    )
+    assert "observation/exterior_image_1_left" in out
+    assert "observation/wrist_image_left" in out
+    assert "observation/exterior_image_2_left" in out
+
 
 def test_sir_droid_repack_transform_with_canonical_camera_keys():
     transform = sir_transforms.SIRDroidRepackTransform()

@@ -499,13 +499,18 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 class LeRobotSIRDROIDDataConfig(DataConfigFactory):
     """Data config for SIR real-world Franka datasets in LeRobot v3 format."""
 
+    # MUST mirror SIRDroidRepackTransform's defaults: these fields are always passed to
+    # the repack in create(), so a key missing HERE is missing at train time even if the
+    # transform's own defaults list it.
     exterior_image_keys: Sequence[str] = (
-        "observation.images.exterior_image_1_left",
-        "observation.images.25916956_left",
+        "observation.images.exterior_image_1_left",  # DROID canonical name
+        "observation.images.25916956_left",  # legacy serial key (marker room = side_1)
+        "observation.images.side_1",  # role-keyed (routing_d1 and newer rooms)
     )
     wrist_image_keys: Sequence[str] = (
-        "observation.images.wrist_image_left",
-        "observation.images.18650758_left",
+        "observation.images.wrist_image_left",  # DROID canonical name
+        "observation.images.18650758_left",  # legacy serial key (marker room = wrist_left)
+        "observation.images.wrist_left",  # role-keyed (routing_d1 and newer rooms)
     )
     # Optional third camera keys. When non-empty, the repack emits a second exterior view
     # and DroidInputs feeds it into the model's third slot (right_wrist_0_rgb) with an
