@@ -1120,6 +1120,11 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+        # Retain ONLY the latest checkpoint (max_to_keep=1, no keep_period pinning):
+        # intermediate saves remain crash insurance but are garbage-collected, so the
+        # run ends with just the final step on disk. No checkpoint-step sweep for
+        # routing (user decision 2026-07-06 — no time/space to test the ladder).
+        keep_period=None,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
