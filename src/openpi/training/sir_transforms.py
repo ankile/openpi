@@ -30,13 +30,19 @@ class SIRDroidRepackTransform(transforms.DataTransformFn):
     """Map SIR real-robot LeRobot samples into OpenPI Droid policy input keys."""
 
     exterior_image_keys: Sequence[str] = (
-        "observation.images.exterior_image_1_left",
-        "observation.images.25916956_left",
+        "observation.images.exterior_image_1_left",  # DROID canonical name
+        "observation.images.25916956_left",  # legacy serial key (marker room = side_1)
+        "observation.images.side_1",  # role-keyed (routing_d1 and newer rooms)
     )
     wrist_image_keys: Sequence[str] = (
-        "observation.images.wrist_image_left",
-        "observation.images.18650758_left",
+        "observation.images.wrist_image_left",  # DROID canonical name
+        "observation.images.18650758_left",  # legacy serial key (marker room = wrist_left)
+        "observation.images.wrist_left",  # role-keyed (routing_d1 and newer rooms)
     )
+    # Optional third camera. When set, emit "observation/exterior_image_2_left" from the
+    # first available key (KeyError if none present — fail loud, no silent skip). Used to
+    # feed a second exterior view (e.g. routing_d1's side_2) into the model's third slot.
+    exterior_image_2_keys: Sequence[str] | None = None
     joint_position_key: str = "observation.state.joint_position"
     gripper_position_key: str = "observation.state.gripper_position"
     action_joint_velocity_key: str = "action.joint_velocity"
@@ -54,6 +60,11 @@ class SIRDroidRepackTransform(transforms.DataTransformFn):
             "observation/joint_position": np.asarray(data[self.joint_position_key], dtype=np.float32),
             "observation/gripper_position": np.asarray(data[self.gripper_position_key], dtype=np.float32),
         }
+
+        if self.exterior_image_2_keys is not None:
+            out["observation/exterior_image_2_left"] = _pick_first_available(
+                data, self.exterior_image_2_keys, "exterior image 2"
+            )
 
         prompt_value = None
         for prompt_key in self.prompt_keys:

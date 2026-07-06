@@ -31,6 +31,11 @@ def _parse_image(image) -> np.ndarray:
 class DroidInputs(transforms.DataTransformFn):
     # Determines which model will be used.
     model_type: _model.ModelType
+    # When True (PI0/PI05 only), feed a second exterior view ("observation/exterior_image_2_left")
+    # into the model's third image slot ("right_wrist_0_rgb") with an ACTIVE mask, instead of the
+    # zeros+False-mask padding used by default. Requires the repack to emit that key (KeyError if
+    # absent — fail loud). Unsupported for PI0_FAST (raises ValueError).
+    use_exterior_image_2: bool = False
 
     def __call__(self, data: dict) -> dict:
         gripper_pos = np.asarray(data["observation/gripper_position"])
@@ -47,9 +52,17 @@ class DroidInputs(transforms.DataTransformFn):
         match self.model_type:
             case _model.ModelType.PI0 | _model.ModelType.PI05:
                 names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
-                images = (base_image, wrist_image, np.zeros_like(base_image))
-                image_masks = (np.True_, np.True_, np.False_)
+                if self.use_exterior_image_2:
+                    # Second exterior view occupies the third slot with an active mask.
+                    third_image = _parse_image(data["observation/exterior_image_2_left"])
+                    images = (base_image, wrist_image, third_image)
+                    image_masks = (np.True_, np.True_, np.True_)
+                else:
+                    images = (base_image, wrist_image, np.zeros_like(base_image))
+                    image_masks = (np.True_, np.True_, np.False_)
             case _model.ModelType.PI0_FAST:
+                if self.use_exterior_image_2:
+                    raise ValueError("use_exterior_image_2 is not supported for PI0_FAST models.")
                 names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
                 # We don't mask out padding images for FAST models.
                 images = (base_image, np.zeros_like(base_image), wrist_image)

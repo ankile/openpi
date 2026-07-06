@@ -507,6 +507,10 @@ class LeRobotSIRDROIDDataConfig(DataConfigFactory):
         "observation.images.wrist_image_left",
         "observation.images.18650758_left",
     )
+    # Optional third camera keys. When set, the repack emits a second exterior view and
+    # DroidInputs feeds it into the model's third slot (right_wrist_0_rgb) with an active
+    # mask (PI0/PI05 only). None => 2-camera behavior, byte-identical to before.
+    exterior_image_2_keys: Sequence[str] | None = None
     # Fixed natural-language instruction injected as the prompt (datasets carry only
     # the task slug, which we no longer use — see SIRDroidRepackTransform).
     default_prompt: str | None = None
@@ -521,11 +525,17 @@ class LeRobotSIRDROIDDataConfig(DataConfigFactory):
                 sir_transforms.SIRDroidRepackTransform(
                     exterior_image_keys=self.exterior_image_keys,
                     wrist_image_keys=self.wrist_image_keys,
+                    exterior_image_2_keys=self.exterior_image_2_keys,
                 )
             ]
         )
         data_transforms = _transforms.Group(
-            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            inputs=[
+                droid_policy.DroidInputs(
+                    model_type=model_config.model_type,
+                    use_exterior_image_2=self.exterior_image_2_keys is not None,
+                )
+            ],
             outputs=[droid_policy.DroidOutputs()],
         )
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
@@ -1069,6 +1079,37 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         # Freeze everything except the action expert params (llm branch with suffix `_1`).
         freeze_filter=nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*")),
+        num_train_steps=20_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        # Fine-tunes pi05 on the routing_d1 real-world line, feeding THREE cameras: side_1 ->
+        # base_0_rgb (exterior_1), wrist_left -> left_wrist_0_rgb (wrist), side_2 ->
+        # right_wrist_0_rgb (third slot, active mask). Full frames, no crops (DROID convention).
+        # Same recipe as pi05_sir_droid_finetune_idle; only the datamix, prompt, and third camera
+        # differ. The routing datasets are role-keyed LeRobot v3 (observation.images.{side_1,
+        # side_2,wrist_left,wrist_right}); routing consumes side_1 + side_2 to cover the rope
+        # end-to-end plus the left wrist (see sir/real/lifecycle/tasks.py ROUTING_D1).
+        name="pi05_sir_droid_finetune_routing_3cam",
+        project_name="real-dagger-mining-01b",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotSIRDROIDDataConfig(
+            repo_id="ankile/real01b-routing-d1-ours-sobol-r0",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="route the rope by seating it into the left clip and then the right clip",
+            exterior_image_2_keys=("observation.images.side_2",),
+            assets=AssetsConfig(
+                # Reuse DROID norm stats and pi05-droid initialization by default.
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+            filter_idle_frames=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
     ),
