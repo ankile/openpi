@@ -507,10 +507,13 @@ class LeRobotSIRDROIDDataConfig(DataConfigFactory):
         "observation.images.wrist_image_left",
         "observation.images.18650758_left",
     )
-    # Optional third camera keys. When set, the repack emits a second exterior view and
-    # DroidInputs feeds it into the model's third slot (right_wrist_0_rgb) with an active
-    # mask (PI0/PI05 only). None => 2-camera behavior, byte-identical to before.
-    exterior_image_2_keys: Sequence[str] | None = None
+    # Optional third camera keys. When non-empty, the repack emits a second exterior view
+    # and DroidInputs feeds it into the model's third slot (right_wrist_0_rgb) with an
+    # active mask (PI0/PI05 only). Empty => 2-camera behavior, byte-identical to before.
+    # Typed Sequence[str] (not `| None`): tyro cannot lower a tuple default through a
+    # `Sequence[str] | None` union when building the train.py CLI (AssertionError in
+    # str_from_instance), so the empty tuple is the disabled sentinel.
+    exterior_image_2_keys: Sequence[str] = ()
     # Fixed natural-language instruction injected as the prompt (datasets carry only
     # the task slug, which we no longer use — see SIRDroidRepackTransform).
     default_prompt: str | None = None
@@ -525,7 +528,7 @@ class LeRobotSIRDROIDDataConfig(DataConfigFactory):
                 sir_transforms.SIRDroidRepackTransform(
                     exterior_image_keys=self.exterior_image_keys,
                     wrist_image_keys=self.wrist_image_keys,
-                    exterior_image_2_keys=self.exterior_image_2_keys,
+                    exterior_image_2_keys=self.exterior_image_2_keys or None,
                 )
             ]
         )
@@ -533,7 +536,7 @@ class LeRobotSIRDROIDDataConfig(DataConfigFactory):
             inputs=[
                 droid_policy.DroidInputs(
                     model_type=model_config.model_type,
-                    use_exterior_image_2=self.exterior_image_2_keys is not None,
+                    use_exterior_image_2=bool(self.exterior_image_2_keys),
                 )
             ],
             outputs=[droid_policy.DroidOutputs()],
