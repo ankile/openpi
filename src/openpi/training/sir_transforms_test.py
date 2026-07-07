@@ -143,6 +143,115 @@ def test_routing_3cam_config_resolves_and_builds_data_config(tmp_path):
     assert "observation/exterior_image_2_left" in out
 
 
+def test_sir_droid_repack_crop_slices_each_slot():
+    # Per-slot crops slice the stored (CHW) frame before the model resize. Distinct boxes
+    # per slot verify no slot borrows another's box.
+    transform = sir_transforms.SIRDroidRepackTransform(
+        exterior_image_2_keys=("observation.images.side_2",),
+        exterior_image_crop=(140, 120, 560, 470),  # w=420, h=350
+        wrist_image_crop=(10, 20, 300, 400),  # w=290, h=380
+        exterior_image_2_crop=(130, 120, 440, 445),  # w=310, h=325
+    )
+    # Fill each camera with a per-pixel ramp so the crop is content-checkable, not just shape.
+    def ramp(seed):
+        a = np.arange(3 * 480 * 640, dtype=np.float32).reshape(3, 480, 640)
+        return a + seed
+
+    item = {
+        "observation.images.side_1": ramp(0.0),
+        "observation.images.wrist_left": ramp(1.0),
+        "observation.images.side_2": ramp(2.0),
+        "observation.state.joint_position": np.zeros((7,), dtype=np.float32),
+        "observation.state.gripper_position": np.array([0.1], dtype=np.float32),
+    }
+    out = transform(item)
+    assert out["observation/exterior_image_1_left"].shape == (3, 350, 420)
+    assert out["observation/wrist_image_left"].shape == (3, 380, 290)
+    assert out["observation/exterior_image_2_left"].shape == (3, 325, 310)
+    # Content parity: cropped slot equals the raw frame's slice [.., y0:y1, x0:x1].
+    np.testing.assert_array_equal(
+        out["observation/exterior_image_1_left"], ramp(0.0)[:, 120:470, 140:560]
+    )
+    np.testing.assert_array_equal(out["observation/wrist_image_left"], ramp(1.0)[:, 20:400, 10:300])
+    np.testing.assert_array_equal(
+        out["observation/exterior_image_2_left"], ramp(2.0)[:, 120:445, 130:440]
+    )
+
+
+def test_sir_droid_repack_crop_none_is_full_frame():
+    # No crop fields => frames pass through unsliced (byte-identical to the pre-crop path).
+    transform = sir_transforms.SIRDroidRepackTransform()
+    item = {
+        "observation.images.side_1": np.zeros((3, 480, 640), dtype=np.float32),
+        "observation.images.wrist_left": np.ones((3, 480, 640), dtype=np.float32),
+        "observation.state.joint_position": np.zeros((7,), dtype=np.float32),
+        "observation.state.gripper_position": np.array([0.1], dtype=np.float32),
+    }
+    out = transform(item)
+    assert out["observation/exterior_image_1_left"].shape == (3, 480, 640)
+    assert out["observation/wrist_image_left"].shape == (3, 480, 640)
+
+
+def test_sir_droid_repack_crop_out_of_bounds_raises():
+    transform = sir_transforms.SIRDroidRepackTransform(exterior_image_crop=(0, 0, 700, 470))
+    item = {
+        "observation.images.side_1": np.zeros((3, 480, 640), dtype=np.float32),
+        "observation.images.wrist_left": np.ones((3, 480, 640), dtype=np.float32),
+        "observation.state.joint_position": np.zeros((7,), dtype=np.float32),
+        "observation.state.gripper_position": np.array([0.1], dtype=np.float32),
+    }
+    with pytest.raises(ValueError, match="exceeds frame"):
+        transform(item)
+
+
+def test_sir_droid_repack_crop_rejects_hwc_layout():
+    # A non-channels-first frame must fail loud, not silently slice the wrong axes.
+    transform = sir_transforms.SIRDroidRepackTransform(exterior_image_crop=(10, 20, 100, 200))
+    item = {
+        "observation.images.side_1": np.zeros((480, 640, 3), dtype=np.float32),  # HWC
+        "observation.images.wrist_left": np.ones((3, 480, 640), dtype=np.float32),
+        "observation.state.joint_position": np.zeros((7,), dtype=np.float32),
+        "observation.state.gripper_position": np.array([0.1], dtype=np.float32),
+    }
+    with pytest.raises(ValueError, match="channels-first"):
+        transform(item)
+
+
+def test_routing_3cam_crop_config_resolves_and_crops(tmp_path):
+    # The cropped routing config resolves, carries the task-fit side boxes, and its
+    # CONFIG-created repack actually crops (regression against the DataConfig-field-shadow
+    # trap: crop fields set only on the transform default would silently not apply).
+    config = _config.get_config("pi05_sir_droid_finetune_routing_3cam_crop")
+    assert tuple(config.data.exterior_image_crop) == (140, 120, 560, 470)
+    assert tuple(config.data.exterior_image_2_crop) == (130, 120, 440, 445)
+    assert tuple(config.data.wrist_image_crop) == ()  # wrist left full-frame
+
+    data_factory = dataclasses.replace(config.data, assets=_config.AssetsConfig())
+    data_config = data_factory.create(tmp_path, config.model)
+    repack = data_config.repack_transforms.inputs[0]
+    out = repack(
+        {
+            "observation.images.side_1": np.zeros((3, 480, 640), dtype=np.float32),
+            "observation.images.wrist_left": np.ones((3, 480, 640), dtype=np.float32),
+            "observation.images.side_2": np.full((3, 480, 640), 0.5, dtype=np.float32),
+            "observation.state.joint_position": np.zeros((7,), dtype=np.float32),
+            "observation.state.gripper_position": np.array([0.1], dtype=np.float32),
+        }
+    )
+    assert out["observation/exterior_image_1_left"].shape == (3, 350, 420)
+    assert out["observation/exterior_image_2_left"].shape == (3, 325, 310)
+    assert out["observation/wrist_image_left"].shape == (3, 480, 640)  # uncropped
+
+
+def test_uncropped_routing_config_has_no_crops():
+    # The still-running full-frame config must NOT have grown crops (a requeue of the live
+    # jobs re-reads this config; a crop here would corrupt a resumed run).
+    config = _config.get_config("pi05_sir_droid_finetune_routing_3cam")
+    assert tuple(config.data.exterior_image_crop) == ()
+    assert tuple(config.data.wrist_image_crop) == ()
+    assert tuple(config.data.exterior_image_2_crop) == ()
+
+
 def test_sir_droid_repack_transform_with_canonical_camera_keys():
     transform = sir_transforms.SIRDroidRepackTransform()
     item = {

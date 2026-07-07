@@ -519,12 +519,34 @@ class LeRobotSIRDROIDDataConfig(DataConfigFactory):
     # `Sequence[str] | None` union when building the train.py CLI (AssertionError in
     # str_from_instance), so the empty tuple is the disabled sentinel.
     exterior_image_2_keys: Sequence[str] = ()
+    # Optional per-slot STATIC crop boxes in STORED-frame (480x640) px, flat
+    # (x0, y0, x1, y1) half-open. Empty tuple => full frame (no crop). Flat Sequence[int]
+    # (NOT tuple[int,int,int,int] | None) is the tyro-safe sentinel: tyro cannot lower a
+    # fixed-length tuple-or-None union with an empty default when train.py builds the CLI
+    # (same trap as exterior_image_2_keys). create() validates length==4 and forwards the
+    # box (or None) to SIRDroidRepackTransform. Applied at TRAIN here; the eval wrapper
+    # reads the SAME boxes off this resolved config so train/eval crop identically.
+    exterior_image_crop: Sequence[int] = ()
+    wrist_image_crop: Sequence[int] = ()
+    exterior_image_2_crop: Sequence[int] = ()
     # Fixed natural-language instruction injected as the prompt (datasets carry only
     # the task slug, which we no longer use — see SIRDroidRepackTransform).
     default_prompt: str | None = None
     # If true, drop idle frame anchors (DROID non-idle range filter ported to LeRobot;
     # see DataConfig.filter_idle_frames).
     filter_idle_frames: bool = False
+
+    @staticmethod
+    def _crop_box_or_none(raw: Sequence[int], name: str) -> tuple[int, int, int, int] | None:
+        """Validate a flat crop sentinel into a (x0,y0,x1,y1) tuple, or None when empty."""
+        box = tuple(int(v) for v in raw)
+        if not box:
+            return None
+        if len(box) != 4:
+            raise ValueError(
+                f"{name} must be exactly 4 ints (x0, y0, x1, y1) or empty; got {box}."
+            )
+        return box  # type: ignore[return-value]
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -534,6 +556,11 @@ class LeRobotSIRDROIDDataConfig(DataConfigFactory):
                     exterior_image_keys=self.exterior_image_keys,
                     wrist_image_keys=self.wrist_image_keys,
                     exterior_image_2_keys=self.exterior_image_2_keys or None,
+                    exterior_image_crop=self._crop_box_or_none(self.exterior_image_crop, "exterior_image_crop"),
+                    wrist_image_crop=self._crop_box_or_none(self.wrist_image_crop, "wrist_image_crop"),
+                    exterior_image_2_crop=self._crop_box_or_none(
+                        self.exterior_image_2_crop, "exterior_image_2_crop"
+                    ),
                 )
             ]
         )
@@ -1124,6 +1151,48 @@ _CONFIGS = [
         # intermediate saves remain crash insurance but are garbage-collected, so the
         # run ends with just the final step on disk. No checkpoint-step sweep for
         # routing (user decision 2026-07-06 — no time/space to test the ladder).
+        keep_period=None,
+    ),
+    TrainConfig(
+        # Cropped variant of pi05_sir_droid_finetune_routing_3cam. Identical recipe/datamix;
+        # the ONLY difference is that the two side views are cropped to the routing_d1
+        # task-fit ROIs BEFORE OpenPI's resize-with-pad to 224 (higher effective resolution
+        # on the rope+clips). A SEPARATE config (not an in-place edit of the uncropped one)
+        # so a --requeue of the running full-frame jobs can never resume onto cropped data.
+        #
+        #   side_1  -> base_0_rgb        crop (140,120,560,470)  [routing_d1 side_1 override]
+        #   wrist_left -> left_wrist_0_rgb   FULL FRAME (no station/task crop applied here)
+        #   side_2  -> right_wrist_0_rgb  crop (130,120,440,445)  [routing_d1 side_2 override]
+        #
+        # Boxes are in STORED-frame (480x640) px and are the SINGLE SOURCE OF TRUTH consumed
+        # by both train (SIRDroidRepackTransform) and eval (openpi_policy_wrapper reads them
+        # off this resolved config). They MUST equal sir.real.lifecycle.tasks ROUTING_D1
+        # camera_crop_overrides — pinned by sir/tests/test_openpi_routing_crop_config.py.
+        name="pi05_sir_droid_finetune_routing_3cam_crop",
+        project_name="real-dagger-mining-01b",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotSIRDROIDDataConfig(
+            repo_id="ankile/real01b-routing-d1-ours-sobol-r0",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="route the rope by seating it into the left clip and then the right clip",
+            exterior_image_2_keys=("observation.images.side_2",),
+            exterior_image_crop=(140, 120, 560, 470),  # side_1 (base_0_rgb)
+            exterior_image_2_crop=(130, 120, 440, 445),  # side_2 (right_wrist_0_rgb)
+            # wrist_image_crop intentionally left empty: routing_d1 has no wrist_left crop
+            # override and the wrist view stays full-frame for pi05 (see line note above).
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+            filter_idle_frames=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=20_000,
+        batch_size=32,
         keep_period=None,
     ),
     #
