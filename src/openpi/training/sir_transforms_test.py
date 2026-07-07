@@ -222,9 +222,9 @@ def test_routing_3cam_crop_config_resolves_and_crops(tmp_path):
     # CONFIG-created repack actually crops (regression against the DataConfig-field-shadow
     # trap: crop fields set only on the transform default would silently not apply).
     config = _config.get_config("pi05_sir_droid_finetune_routing_3cam_crop")
-    assert tuple(config.data.exterior_image_crop) == (140, 120, 560, 470)
-    assert tuple(config.data.exterior_image_2_crop) == (130, 120, 440, 445)
-    assert tuple(config.data.wrist_image_crop) == ()  # wrist left full-frame
+    assert tuple(config.data.exterior_image_crop) == (140, 120, 560, 470)  # side_1 override
+    assert tuple(config.data.wrist_image_crop) == (180, 0, 639, 413)  # wrist_left station default
+    assert tuple(config.data.exterior_image_2_crop) == (130, 120, 440, 445)  # side_2 override
 
     data_factory = dataclasses.replace(config.data, assets=_config.AssetsConfig())
     data_config = data_factory.create(tmp_path, config.model)
@@ -238,9 +238,9 @@ def test_routing_3cam_crop_config_resolves_and_crops(tmp_path):
             "observation.state.gripper_position": np.array([0.1], dtype=np.float32),
         }
     )
-    assert out["observation/exterior_image_1_left"].shape == (3, 350, 420)
-    assert out["observation/exterior_image_2_left"].shape == (3, 325, 310)
-    assert out["observation/wrist_image_left"].shape == (3, 480, 640)  # uncropped
+    assert out["observation/exterior_image_1_left"].shape == (3, 350, 420)  # side_1 350x420
+    assert out["observation/wrist_image_left"].shape == (3, 413, 459)  # wrist 413x459
+    assert out["observation/exterior_image_2_left"].shape == (3, 325, 310)  # side_2 325x310
 
 
 def test_uncropped_routing_config_has_no_crops():

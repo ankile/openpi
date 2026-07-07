@@ -1161,13 +1161,16 @@ _CONFIGS = [
         # so a --requeue of the running full-frame jobs can never resume onto cropped data.
         #
         #   side_1  -> base_0_rgb        crop (140,120,560,470)  [routing_d1 side_1 override]
-        #   wrist_left -> left_wrist_0_rgb   FULL FRAME (no station/task crop applied here)
+        #   wrist_left -> left_wrist_0_rgb   crop (180,0,639,413)  [station wrist default]
         #   side_2  -> right_wrist_0_rgb  crop (130,120,440,445)  [routing_d1 side_2 override]
         #
         # Boxes are in STORED-frame (480x640) px and are the SINGLE SOURCE OF TRUTH consumed
         # by both train (SIRDroidRepackTransform) and eval (openpi_policy_wrapper reads them
-        # off this resolved config). They MUST equal sir.real.lifecycle.tasks ROUTING_D1
-        # camera_crop_overrides — pinned by sir/tests/test_openpi_routing_crop_config.py.
+        # off this resolved config). They are exactly the crops a routing_d1 DP policy would
+        # use for these three consumed roles = merge(STATION_CAMERA_DEFAULT_CROPS, routing_d1
+        # camera_crop_overrides): side_1/side_2 task overrides + the station wrist_left default
+        # (same wrist crop marker_d2 DP trains with) — pinned by
+        # sir/tests/test_openpi_routing_crop_config.py.
         name="pi05_sir_droid_finetune_routing_3cam_crop",
         project_name="real-dagger-mining-01b",
         model=pi0_config.Pi0Config(
@@ -1180,10 +1183,9 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=False),
             default_prompt="route the rope by seating it into the left clip and then the right clip",
             exterior_image_2_keys=("observation.images.side_2",),
-            exterior_image_crop=(140, 120, 560, 470),  # side_1 (base_0_rgb)
-            exterior_image_2_crop=(130, 120, 440, 445),  # side_2 (right_wrist_0_rgb)
-            # wrist_image_crop intentionally left empty: routing_d1 has no wrist_left crop
-            # override and the wrist view stays full-frame for pi05 (see line note above).
+            exterior_image_crop=(140, 120, 560, 470),  # side_1 (base_0_rgb) — task override
+            wrist_image_crop=(180, 0, 639, 413),  # wrist_left (left_wrist_0_rgb) — station default
+            exterior_image_2_crop=(130, 120, 440, 445),  # side_2 (right_wrist_0_rgb) — task override
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
                 asset_id="droid",
