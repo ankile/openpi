@@ -21,9 +21,11 @@ off any quota'd home (delta `/u` is 103G-capped) — put both on scratch/work.
 
 ```bash
 export UV_CACHE_DIR=/work/.../uv-cache          # NOT ~/.cache on quota'd homes
+export UV_PYTHON_INSTALL_DIR=/work/.../uv-python
 cd <clone>/deps/openpi
 cp sir_scripts/training_env/pyproject.toml .    # swap robot env -> training env
 cp sir_scripts/training_env/uv.lock .
+echo 3.12 > .python-version                     # robot checkout pins 3.11; training is 3.12
 uv python install 3.12
 uv sync --frozen                                # exact iris resolution
 # smoke: uv run --no-sync python scripts/train.py pi05_sir_droid_finetune_routing_3cam_crop --help
@@ -31,3 +33,15 @@ uv sync --frozen                                # exact iris resolution
 
 `../lerobot` resolves to `deps/lerobot` automatically. `OPENPI_DIR` for the launch
 script is then `<clone>/deps/openpi`.
+
+### FFmpeg for torchcodec (only where there is no system FFmpeg, e.g. delta)
+
+torchcodec (lerobot[dataset] video decode) dlopens FFmpeg 4-7 shared libs. iris has
+system ffmpeg; delta has none. `link_bundled_ffmpeg.sh` exposes PyAV's already-bundled
+FFmpeg 7 under the standard sonames — no system install needed:
+
+```bash
+bash sir_scripts/training_env/link_bundled_ffmpeg.sh   # from the checkout root; prints the path
+# then at run time (the launch script does this automatically on SIR_CLUSTER=delta):
+export LD_LIBRARY_PATH="$PWD/.ffmpeg-compat:$PWD/.venv/lib/python3.12/site-packages/av.libs:$LD_LIBRARY_PATH"
+```
