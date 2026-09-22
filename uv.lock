@@ -2990,7 +2990,7 @@ requires-dist = [
     { name = "orbax-checkpoint", specifier = "==0.11.13" },
     { name = "pillow", specifier = ">=11.0.0" },
     { name = "polars", specifier = ">=1.30.0" },
-    { name = "policy-arena", editable = "../../../policy-arena/python" },
+    { name = "policy-arena", editable = "../policy_arena/python" },
     { name = "rich", specifier = ">=14.0.0" },
     { name = "sentencepiece", specifier = ">=0.2.0" },
     { name = "torch", specifier = "==2.7.1" },
@@ -3278,7 +3278,7 @@ wheels = [
 [[package]]
 name = "policy-arena"
 version = "0.1.0"
-source = { editable = "../../../policy-arena/python" }
+source = { editable = "../policy_arena/python" }
 dependencies = [
     { name = "convex" },
 ]

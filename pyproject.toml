@@ -70,7 +70,7 @@ override-dependencies = [
 [tool.uv.sources]
 openpi-client = { workspace = true }
 lerobot = { path = "../lerobot", editable = true }
-policy-arena = { path = "../../../policy-arena/python", editable = true }
+policy-arena = { path = "../policy_arena/python", editable = true }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
 
 [tool.uv.workspace]
