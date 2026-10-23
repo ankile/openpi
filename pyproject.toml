@@ -3,7 +3,7 @@ name = "openpi"
 version = "0.1.0"
 description = "Physical Intelligence open source repo"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"  # zima/lerobot-v3: LeRobot 0.6
 license = { file = "LICENSE" }
 dependencies = [
     "augmax>=0.3.4",
@@ -13,13 +13,20 @@ dependencies = [
     "flatbuffers>=24.3.25",
     "flax==0.10.2",
     "fsspec[gcs]>=2024.6.0",
-    "gym-aloha>=0.1.1",
+    # zima/lerobot-v3: gym-aloha dropped (only examples/aloha_sim uses it; its mujoco 2.3.7 has no cp312 wheel)
     "imageio>=2.36.1",
     "jax[cuda12]==0.5.3",
     "jaxtyping==0.2.36",
-    "lerobot",
+    # zima/lerobot-v3: LeRobot 0.6 reads LeRobot v3.0 datasets (0cf8648 read only v2.1). Without the
+    # [dataset] extra, so torchcodec stays out and LeRobot decodes video with PyAV.
+    "lerobot==0.6.0",
+    "datasets>=4.7.0,<5.0.0",
+    "pandas>=2.0.0,<3.0.0",
+    "pyarrow>=21.0.0,<30.0.0",
+    "av>=15.0.0,<16.0.0",
+    "jsonlines>=4.0.0,<5.0.0",
     "ml_collections==1.0.0",
-    "numpy>=1.22.4,<2.0.0",
+    "numpy>=2.0.0,<2.3.0",  # zima/lerobot-v3: LeRobot 0.6 needs numpy 2
     "numpydantic>=1.6.6",
     "opencv-python>=4.10.0.84",
     "openpi-client",
@@ -35,7 +42,7 @@ dependencies = [
     "beartype==0.19.0",
     "chex==0.1.90",
     "treescope>=0.1.7",
-    "transformers==4.53.2",
+    "transformers>=5.0.0,<6.0.0",  # zima/lerobot-v3: huggingface-hub 1.x (LeRobot 0.6); only the FAST tokenizer imports it
     "rich>=14.0.0",
     "polars>=1.30.0",
 ]
@@ -54,20 +61,15 @@ dev = [
     "matplotlib>=3.10.0",
     "pynvml>=12.0.0",
 ]
-rlds = [
-    # NOTE: tensorflow-cpu 2.15.0 only ships cp311 wheels on PyPI.
-    # Use `uv venv --python 3.11` before `uv sync --group rlds`.
-    "dlimp",
-    "tensorflow-cpu==2.15.0",
-    "tensorflow-datasets==4.9.9",
-]
+# zima/lerobot-v3: the RLDS group (tensorflow-cpu 2.15: numpy<2, cp311 only) cannot coexist with
+# LeRobot 0.6; DROID RLDS training is not used here.
+rlds = []
 
 [tool.uv]
 override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }
-lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
 
 [tool.uv.workspace]

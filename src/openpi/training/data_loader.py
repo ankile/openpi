@@ -7,7 +7,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.datasets.lerobot_dataset as lerobot_dataset  # zima/lerobot-v3: LeRobot 0.6 (was lerobot.common...)
 import numpy as np
 import torch
 
@@ -127,6 +127,14 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _task_mapping(tasks) -> dict[int, str]:
+    """task_index -> task. LeRobot v3 metadata keeps tasks as a DataFrame indexed by task with a
+    task_index column (v2.1: already a dict)."""
+    if hasattr(tasks, "iterrows"):
+        return {int(row.task_index): str(task) for task, row in tasks.iterrows()}
+    return dict(tasks)
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -146,7 +154,7 @@ def create_torch_dataset(
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(_task_mapping(dataset_meta.tasks))])
 
     return dataset
 
