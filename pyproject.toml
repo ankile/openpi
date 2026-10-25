@@ -19,7 +19,7 @@ dependencies = [
     "jaxtyping==0.2.36",
     # zima/lerobot-v3: LeRobot 0.6 reads LeRobot v3.0 datasets (0cf8648 read only v2.1). Without the
     # [dataset] extra, so torchcodec stays out and LeRobot decodes video with PyAV.
-    "lerobot==0.6.0",
+    "lerobot==0.6.1",   # zima: the same LeRobot release as zima's dataset and learning environments
     "datasets>=4.7.0,<5.0.0",
     "pandas>=2.0.0,<3.0.0",
     "pyarrow>=21.0.0,<30.0.0",
