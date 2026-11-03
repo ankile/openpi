@@ -4,6 +4,7 @@ import pathlib
 from typing import Any
 
 import jax.numpy as jnp
+import numpy as np
 
 from openpi.models import rtc as _rtc
 import openpi.models.model as _model
@@ -50,7 +51,8 @@ def create_trained_policy(
         presence of "model.safensors" in the checkpoint directory.
     """
     repack_transforms = repack_transforms or transforms.Group()
-    _check_sample_kwargs(train_config, sample_kwargs or {})
+    sample_kwargs = dict(sample_kwargs or {})
+    _check_sample_kwargs(train_config, sample_kwargs)  # validates and normalizes to Python numbers
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
 
     # Check if this is a PyTorch model by looking for model.safetensors
@@ -118,12 +120,15 @@ def _check_sample_kwargs(train_config, sample_kwargs) -> None:
         steps = sample_kwargs["num_steps"]
         if not isinstance(train_config.model, _pi0_config.Pi0Config):
             raise ValueError(f"num_steps applies to flow-matching pi0/pi0.5 models only, not {train_config.name}")
-        if type(steps) is not int or steps < 1:
+        if isinstance(steps, bool | np.bool_) or not isinstance(steps, int | np.integer) or steps < 1:
             raise ValueError(f"num_steps must be a positive integer, got {steps!r}")
+        sample_kwargs["num_steps"] = int(steps)
     if "max_guidance_weight" in sample_kwargs:
         weight = sample_kwargs["max_guidance_weight"]
-        if isinstance(weight, bool) or not isinstance(weight, int | float) or not 0 <= weight < float("inf"):
+        real = isinstance(weight, int | float | np.integer | np.floating) and not isinstance(weight, bool | np.bool_)
+        if not real or not 0 <= float(weight) < float("inf"):
             raise ValueError(f"max_guidance_weight must be a finite number >= 0 (0 turns guidance off), got {weight!r}")
+        sample_kwargs["max_guidance_weight"] = float(weight)
 
 
 def _actions_pass_through(train_config, data_config, repack_transforms) -> bool:

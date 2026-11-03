@@ -161,11 +161,24 @@ def test_padding_cannot_overflow_into_the_guidance(monkeypatch):
         ({"max_guidance_weight": float("inf")}, "finite number"),
         ({"max_guidance_weight": -1.0}, "finite number"),
         ({"max_guidance_weight": float("nan")}, "finite number"),
+        ({"num_steps": True}, "positive integer"),
+        ({"num_steps": np.int64(0)}, "positive integer"),
+        ({"max_guidance_weight": np.True_}, "finite number"),
     ],
 )
 def test_bad_sampler_settings_are_refused_at_the_factory(kwargs, match):
     with pytest.raises(ValueError, match=match):
         _policy_config.create_trained_policy(_config.get_config("pi05_droid"), "/nonexistent", sample_kwargs=kwargs)
+
+
+@pytest.mark.parametrize("weight", [np.float32(0), np.float32(5), np.int64(5), np.float64(5), 5])
+def test_numpy_sampler_settings_are_accepted_and_normalized(monkeypatch, weight):
+    policy = _policy(
+        monkeypatch, "pi05_droid", sample_kwargs={"max_guidance_weight": weight, "num_steps": np.int64(10)}
+    )
+    assert policy.metadata["rtc"]["guidance"]["max_weight"] == float(weight)
+    assert type(policy._sample_kwargs["max_guidance_weight"]) is float
+    assert type(policy._sample_kwargs["num_steps"]) is int
 
 
 def test_zero_guidance_weight_is_guidance_off(monkeypatch):
