@@ -970,6 +970,18 @@ _CONFIGS = [
     *polaris_config.get_polaris_configs(),
 ]
 
+
+def _rtc_variant(name: str, base_name: str, simulated_delay: int) -> TrainConfig:
+    """zima/rtc: `base_name` with training-time real-time chunking (arXiv 2512.05964) and nothing else changed."""
+    (base,) = (c for c in _CONFIGS if c.name == base_name)
+    return dataclasses.replace(
+        base, name=name, model=dataclasses.replace(base.model, simulated_delay=simulated_delay)
+    )
+
+
+# Trained delays 0..7 at 15 Hz (up to 467 ms in flight): docs/design/2026-11-02-rtc-pi05.md in zima.
+_CONFIGS.append(_rtc_variant("pi05_droid_finetune_rtc", "pi05_droid_finetune", simulated_delay=8))
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}

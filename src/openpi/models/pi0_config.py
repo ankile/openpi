@@ -34,7 +34,20 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = "max-autotune"
 
+    # zima/rtc: training-time real-time chunking (arXiv 2512.05964). With D set, every training example gets a
+    # delay d ~ U{0..D-1}; its first d actions are given clean (flow time 0) and masked from the loss. At
+    # inference an action prefix is then inpainted. None (the default) is upstream's model and training, unchanged.
+    simulated_delay: int | None = None
+
     def __post_init__(self):
+        if self.simulated_delay is not None:
+            if not self.pi05:
+                raise ValueError("simulated_delay (real-time chunking) is implemented for pi0.5 only")
+            if not 1 <= self.simulated_delay < self.action_horizon:
+                raise ValueError(
+                    f"simulated_delay must be in [1, action_horizon={self.action_horizon}) so every example keeps a "
+                    f"supervised action, got {self.simulated_delay}"
+                )
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:

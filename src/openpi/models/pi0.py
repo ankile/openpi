@@ -9,6 +9,7 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
+from openpi.models import rtc as _rtc
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
@@ -67,6 +68,8 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        # zima/rtc: training-time real-time chunking; None is upstream's model
+        self.simulated_delay = config.simulated_delay
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -138,13 +141,18 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"] | at.Float[at.Array, "b ah"],
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
-        at.Float[at.Array, "b emb"] | None,
+        at.Float[at.Array, "b emb"] | at.Float[at.Array, "b _ah emb"] | None,
     ]:
+        """`timestep` is one flow time per example (upstream) or, for real-time chunking, one per action token
+        (pi0.5 only: the per-token time reaches the action expert through adaRMS as a (b, ah, emb) condition)."""
         input_mask = []
         ar_mask = []
         tokens = []
@@ -158,7 +166,14 @@ class Pi0(_model.BaseModel):
 
         action_tokens = self.action_in_proj(noisy_actions)
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        if timestep.ndim == 1:
+            time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        else:
+            if not self.pi05:
+                raise ValueError("per-token flow time (real-time chunking) is implemented for pi0.5 only")
+            time_emb = posemb_sincos(
+                timestep.reshape(-1), self.action_in_proj.out_features, min_period=4e-3, max_period=4.0
+            ).reshape(*timestep.shape, -1)
         if self.pi05:
             # time MLP (for adaRMS)
             time_emb = self.time_mlp_in(time_emb)
@@ -189,6 +204,8 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        if self.simulated_delay is not None:
+            return self._compute_loss_rtc(rng, observation, actions, train=train)
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -213,6 +230,45 @@ class Pi0(_model.BaseModel):
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
+    def _compute_loss_rtc(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool
+    ) -> at.Float[at.Array, "b ah"]:
+        """Training-time real-time chunking (arXiv 2512.05964, Alg. 1), in openpi's t=1-is-noise convention.
+
+        Each example draws a delay d ~ U{0..D-1}. Its first d actions are given clean (flow time 0) and carry
+        no loss. The returned (b, ah) loss is scaled so that train.py's plain mean is the paper's batch-token
+        mean, sum(loss * mask) / sum(mask): every supervised token weighs the same, as in the published recipe.
+        """
+        preprocess_rng, noise_rng, time_rng, delay_rng = jax.random.split(rng, 4)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+
+        if actions.ndim != 3:
+            raise ValueError(f"real-time chunking expects actions (b, ah, ad), got {actions.shape}")
+        batch_size = actions.shape[0]
+        noise = jax.random.normal(noise_rng, actions.shape)
+        time = jax.random.beta(time_rng, 1.5, 1, (batch_size,)) * 0.999 + 0.001
+        delay = jax.random.randint(delay_rng, (batch_size,), 0, self.simulated_delay)
+        supervised = jnp.arange(self.action_horizon)[None, :] >= delay[:, None]  # (b, ah)
+        time = jnp.where(supervised, time[:, None], 0.0)  # prefix tokens are clean
+        x_t = time[..., None] * noise + (1 - time[..., None]) * actions
+        u_t = noise - actions
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
+        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+        )
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+        loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        mask = supervised.astype(loss.dtype)
+        # every example keeps >= ah - D + 1 >= 2 supervised tokens (Pi0Config checks D < ah), so the sum is > 0
+        return loss * mask * (mask.size / jnp.sum(mask))
+
     @override
     def sample_actions(
         self,
@@ -221,7 +277,20 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        action_prefix: _rtc.ActionPrefix | None = None,
+        max_guidance_weight: float | at.Float[at.Array, ""] = _rtc.DEFAULT_MAX_GUIDANCE_WEIGHT,
     ) -> _model.Actions:
+        """Sample a chunk. With `action_prefix` (zima/rtc, pi0.5 only) the chunk continues from it: inpainted
+        for a model trained with `simulated_delay`, guided (arXiv 2506.07339) for one trained without."""
+        if action_prefix is not None:
+            return self._sample_actions_rtc(
+                rng,
+                observation,
+                num_steps=num_steps,
+                noise=noise,
+                action_prefix=action_prefix,
+                max_guidance_weight=max_guidance_weight,
+            )
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -276,4 +345,74 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0
+
+    def _sample_actions_rtc(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""],
+        noise: at.Float[at.Array, "b ah ad"] | None,
+        action_prefix: _rtc.ActionPrefix,
+        max_guidance_weight: float | at.Float[at.Array, ""],
+    ) -> _model.Actions:
+        if not self.pi05:
+            raise ValueError("an action prefix (real-time chunking) is implemented for pi0.5 only")
+        observation = _model.preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+        prefix_actions = action_prefix.actions.astype(noise.dtype)
+        action_prefix = action_prefix.replace(actions=prefix_actions)
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        def velocity(x_t, time):
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            assert prefix_out is None
+            return self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+        inpaint = self.simulated_delay is not None
+        delay_mask = _rtc.delay_mask(action_prefix, self.action_horizon)  # (b, ah)
+
+        def step(carry):
+            x_t, time = carry
+            if inpaint:
+                # 2512.05964: the committed actions are given clean (flow time 0), as in training
+                x_t = jnp.where(delay_mask[..., None], prefix_actions, x_t)
+                token_time = jnp.where(delay_mask, 0.0, jnp.broadcast_to(time, (batch_size, self.action_horizon)))
+                v_t = velocity(x_t, token_time)
+            else:
+                v_t = _rtc.guided_velocity(
+                    lambda x: velocity(x, jnp.broadcast_to(time, batch_size)),
+                    x_t,
+                    time,
+                    action_prefix,
+                    max_weight=max_guidance_weight,
+                )
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            x_t, time = carry
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, jnp.asarray(1.0, jnp.float32)))
+        if inpaint:
+            x_0 = jnp.where(delay_mask[..., None], prefix_actions, x_0)
         return x_0
