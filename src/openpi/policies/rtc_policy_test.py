@@ -111,7 +111,8 @@ def test_prefix_round_trip_through_the_action_transforms(monkeypatch):
     np.testing.assert_array_equal(model_space[:, 8:], 0.0)  # padded dims are zero, as in training
     out = policy.infer(_request({"actions": raw, "delay": 3, "prefix_length": 8}))
     np.testing.assert_allclose(out["actions"][:8], raw[:8], atol=1e-5)  # the prefix rows; the rest is padding
-    np.testing.assert_allclose(out["actions"][8:], 0.0, atol=1e-5)  # padding is zeroed before the transform
+    # padding is zero in model space: un-normalized it is the quantile midpoint, whatever the robot sent
+    np.testing.assert_allclose(out["actions"][8:], policy.infer(_request())["actions"][8:], atol=1e-5)
     # no prefix: the plain path (the echo model's zeros, un-normalized)
     assert policy.infer(_request())["actions"].shape == (16, 8)
 
@@ -143,13 +144,33 @@ def test_bad_prefixes_are_refused(monkeypatch, prefix, match):
 
 def test_padding_cannot_overflow_into_the_guidance(monkeypatch):
     policy = _policy(monkeypatch, "pi05_droid")
-    actions = _raw_prefix(15)
+    actions = _raw_prefix(15).astype(np.float64)
     actions[6:] = 1e300  # finite in float64, inf in float32, beyond prefix_length
+    assert np.isfinite(actions).all()
     prefix = policy._action_prefix({"actions": actions, "delay": 2, "prefix_length": 6})
     assert np.isfinite(np.asarray(prefix.actions)).all()
-    np.testing.assert_array_equal(
-        np.asarray(prefix.actions)[0, 6:], np.asarray(policy._action_prefix_transform(np.zeros((9, 8))), np.float32)
-    )
+    np.testing.assert_array_equal(np.asarray(prefix.actions)[0, 6:], 0.0)  # model-space padding is zero
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"num_steps": 0}, "positive integer"),
+        ({"num_steps": -1}, "positive integer"),
+        ({"num_steps": 2.5}, "positive integer"),
+        ({"max_guidance_weight": float("inf")}, "finite number"),
+        ({"max_guidance_weight": -1.0}, "finite number"),
+        ({"max_guidance_weight": float("nan")}, "finite number"),
+    ],
+)
+def test_bad_sampler_settings_are_refused_at_the_factory(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _policy_config.create_trained_policy(_config.get_config("pi05_droid"), "/nonexistent", sample_kwargs=kwargs)
+
+
+def test_zero_guidance_weight_is_guidance_off(monkeypatch):
+    policy = _policy(monkeypatch, "pi05_droid", sample_kwargs={"max_guidance_weight": 0.0})
+    assert policy.metadata["rtc"]["guidance"]["max_weight"] == 0.0
 
 
 def test_num_steps_is_refused_for_models_without_it(monkeypatch):
@@ -171,9 +192,6 @@ def _serve_policy():
 
 def test_serve_settings_and_warm_up(monkeypatch):
     serve = _serve_policy()
-    for bad in (0, -1):
-        with pytest.raises(ValueError, match="num_steps"):
-            serve._sample_kwargs(serve.Args(num_steps=bad))
     assert "num_steps" not in serve._sample_kwargs(serve.Args())  # the model's own default graph
 
     class Recorder:

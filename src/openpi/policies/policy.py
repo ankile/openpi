@@ -169,7 +169,8 @@ class Policy(BasePolicy):
         if not np.isfinite(actions).all():
             raise ValueError("action_prefix actions must be finite")
         model_actions = np.asarray(self._action_prefix_transform(actions), np.float32)
-        if not np.isfinite(model_actions[:prefix_length]).all():
+        model_actions[prefix_length:] = 0.0  # padding in model space too: guidance reads every row
+        if not np.isfinite(model_actions).all():
             raise ValueError("action_prefix actions are not finite after normalization (out of float32 range)")
         return _rtc.ActionPrefix(
             actions=jnp.asarray(model_actions)[None],

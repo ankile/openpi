@@ -93,10 +93,6 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 def _sample_kwargs(args: Args | None) -> dict:
     if args is None:
         return {}
-    if type(args.num_steps) is not int or args.num_steps < 1:
-        raise ValueError(f"num_steps must be a positive integer, got {args.num_steps!r}")
-    if not args.max_guidance_weight > 0:
-        raise ValueError(f"max_guidance_weight must be positive, got {args.max_guidance_weight!r}")
     # openpi's default step count is left to the model, so a request without a prefix runs upstream's graph
     out = {"max_guidance_weight": args.max_guidance_weight}
     if args.num_steps != 10:

@@ -50,8 +50,7 @@ def create_trained_policy(
         presence of "model.safensors" in the checkpoint directory.
     """
     repack_transforms = repack_transforms or transforms.Group()
-    if "num_steps" in (sample_kwargs or {}) and not isinstance(train_config.model, _pi0_config.Pi0Config):
-        raise ValueError(f"num_steps applies to flow-matching pi0/pi0.5 models only, not {train_config.name}")
+    _check_sample_kwargs(train_config, sample_kwargs or {})
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
 
     # Check if this is a PyTorch model by looking for model.safetensors
@@ -111,6 +110,20 @@ def create_trained_policy(
         action_prefix_transform=prefix_transform,
         rtc=rtc_info,
     )
+
+
+def _check_sample_kwargs(train_config, sample_kwargs) -> None:
+    """zima/rtc: refuse sampler settings the model cannot take or that break sampling, before any weights load."""
+    if "num_steps" in sample_kwargs:
+        steps = sample_kwargs["num_steps"]
+        if not isinstance(train_config.model, _pi0_config.Pi0Config):
+            raise ValueError(f"num_steps applies to flow-matching pi0/pi0.5 models only, not {train_config.name}")
+        if type(steps) is not int or steps < 1:
+            raise ValueError(f"num_steps must be a positive integer, got {steps!r}")
+    if "max_guidance_weight" in sample_kwargs:
+        weight = sample_kwargs["max_guidance_weight"]
+        if isinstance(weight, bool) or not isinstance(weight, int | float) or not 0 <= weight < float("inf"):
+            raise ValueError(f"max_guidance_weight must be a finite number >= 0 (0 turns guidance off), got {weight!r}")
 
 
 def _actions_pass_through(train_config, data_config, repack_transforms) -> bool:
