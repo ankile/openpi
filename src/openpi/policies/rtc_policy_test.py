@@ -1,9 +1,11 @@
+# ruff: noqa: SLF001  # tests reach into the model and policy internals they test
 """zima/rtc: the server side of real-time chunking. The real DROID transforms and pi05_droid norm stats around a
 fake model that echoes the prefix it is given, so no weights are needed (the norm stats and tokenizer come
 from openpi's download cache)."""
 
 import dataclasses
 import pathlib
+import typing
 
 import flax.nnx as nnx
 import jax.numpy as jnp
@@ -16,8 +18,8 @@ from openpi.policies import droid_policy
 from openpi.policies import policy_config as _policy_config
 from openpi.shared import download
 from openpi.shared import normalize
-import openpi.transforms as _transforms
 from openpi.training import config as _config
+import openpi.transforms as _transforms
 
 
 class EchoModel(nnx.Module):
@@ -108,7 +110,8 @@ def test_prefix_round_trip_through_the_action_transforms(monkeypatch):
     assert model_space.shape == (16, 32)
     np.testing.assert_array_equal(model_space[:, 8:], 0.0)  # padded dims are zero, as in training
     out = policy.infer(_request({"actions": raw, "delay": 3, "prefix_length": 8}))
-    np.testing.assert_allclose(out["actions"], raw, atol=1e-5)
+    np.testing.assert_allclose(out["actions"][:8], raw[:8], atol=1e-5)  # the prefix rows; the rest is padding
+    np.testing.assert_allclose(out["actions"][8:], 0.0, atol=1e-5)  # padding is zeroed before the transform
     # no prefix: the plain path (the echo model's zeros, un-normalized)
     assert policy.infer(_request())["actions"].shape == (16, 8)
 
@@ -126,6 +129,9 @@ def test_prefix_round_trip_through_the_action_transforms(monkeypatch):
         ({"actions": np.zeros((16, 8)), "delay": True, "prefix_length": 4}, "integer"),
         ({"actions": np.zeros((16, 8)), "delay": 1.5, "prefix_length": 4}, "integer"),
         ({"actions": np.zeros((16, 8)), "delay": 1}, "action_prefix must be"),
+        ({"actions": np.zeros((16, 8), complex), "delay": 1, "prefix_length": 4}, "real numbers"),
+        ({"actions": np.zeros((16, 8), bool), "delay": 1, "prefix_length": 4}, "real numbers"),
+        ({"actions": np.full((16, 8), 1e300), "delay": 1, "prefix_length": 4}, "after normalization"),
         ({"actions": np.zeros((16, 8)), "delay": 1, "prefix_length": 4, "extra": 0}, "action_prefix must be"),
     ],
 )
@@ -133,6 +139,61 @@ def test_bad_prefixes_are_refused(monkeypatch, prefix, match):
     policy = _policy(monkeypatch, "pi05_droid_finetune_rtc")
     with pytest.raises(ValueError, match=match):
         policy.infer(_request(prefix))
+
+
+def test_padding_cannot_overflow_into_the_guidance(monkeypatch):
+    policy = _policy(monkeypatch, "pi05_droid")
+    actions = _raw_prefix(15)
+    actions[6:] = 1e300  # finite in float64, inf in float32, beyond prefix_length
+    prefix = policy._action_prefix({"actions": actions, "delay": 2, "prefix_length": 6})
+    assert np.isfinite(np.asarray(prefix.actions)).all()
+    np.testing.assert_array_equal(
+        np.asarray(prefix.actions)[0, 6:], np.asarray(policy._action_prefix_transform(np.zeros((9, 8))), np.float32)
+    )
+
+
+def test_num_steps_is_refused_for_models_without_it(monkeypatch):
+    with pytest.raises(ValueError, match="num_steps applies"):
+        _policy_config.create_trained_policy(
+            _config.get_config("pi0_fast_droid"), "/nonexistent", sample_kwargs={"num_steps": 5}
+        )
+
+
+def _serve_policy():
+    import importlib.util
+
+    path = pathlib.Path(__file__).resolve().parents[3] / "scripts" / "serve_policy.py"
+    spec = importlib.util.spec_from_file_location("serve_policy_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_serve_settings_and_warm_up(monkeypatch):
+    serve = _serve_policy()
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="num_steps"):
+            serve._sample_kwargs(serve.Args(num_steps=bad))
+    assert "num_steps" not in serve._sample_kwargs(serve.Args())  # the model's own default graph
+
+    class Recorder:
+        rtc: typing.ClassVar = {"mode": "inpaint", "simulated_delay": 1, "action_horizon": 16, "action_dim": 8}
+
+        def __init__(self):
+            self.requests = []
+
+        def infer(self, obs):
+            self.requests.append(obs)
+            return {}
+
+    policy = Recorder()
+    serve.warm_up(policy)  # D = 1 trains only delay 0
+    assert policy.requests[1]["action_prefix"]["delay"] == 0
+    policy.rtc = None
+    checkpoint = serve.Args(env=serve.EnvMode.DROID, policy=serve.Checkpoint(config="pi05_libero", dir="x"))
+    assert not serve.should_warm_up(checkpoint, policy)  # an explicit non-DROID checkpoint gets no DROID inputs
+    assert serve.should_warm_up(serve.Args(env=serve.EnvMode.DROID), policy)
+    assert not serve.should_warm_up(serve.Args(env=serve.EnvMode.LIBERO), policy)
 
 
 def test_guidance_has_no_trained_range_but_keeps_the_rest(monkeypatch):

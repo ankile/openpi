@@ -1,5 +1,4 @@
-from collections.abc import Callable
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import logging
 import math
 import pathlib
@@ -146,11 +145,13 @@ class Policy(BasePolicy):
             raise ValueError("action_prefix must be {'actions', 'delay', 'prefix_length'}")
         horizon, width = self._rtc["action_horizon"], self._rtc["action_dim"]
         actions = np.asarray(raw["actions"])
-        if actions.shape != (horizon, width) or not np.issubdtype(actions.dtype, np.number):
-            raise ValueError(f"action_prefix actions must be numbers of shape ({horizon}, {width}), got {actions.shape}")
+        real = np.issubdtype(actions.dtype, np.floating) or np.issubdtype(actions.dtype, np.integer)
+        if actions.shape != (horizon, width) or not real or actions.dtype == np.bool_:
+            raise ValueError(
+                f"action_prefix actions must be real numbers of shape ({horizon}, {width}), got {actions.dtype} "
+                f"{actions.shape}"
+            )
         actions = actions.astype(np.float64)
-        if not np.isfinite(actions).all():
-            raise ValueError("action_prefix actions must be finite")
         delay, prefix_length = (_integer(raw[k], k) for k in ("delay", "prefix_length"))
         if not 0 <= delay <= prefix_length <= horizon:
             raise ValueError(
@@ -162,7 +163,14 @@ class Policy(BasePolicy):
                 f"delay {delay} is outside the trained range 0..{self._rtc['simulated_delay'] - 1} "
                 "(simulated_delay); the model never saw a longer prefix"
             )
+        # Only the first prefix_length rows mean anything; the rest is padding, set to zero before it can
+        # overflow (a finite 1e300 becomes inf in float32, and 0 * inf is NaN in the guidance error).
+        actions[prefix_length:] = 0.0
+        if not np.isfinite(actions).all():
+            raise ValueError("action_prefix actions must be finite")
         model_actions = np.asarray(self._action_prefix_transform(actions), np.float32)
+        if not np.isfinite(model_actions[:prefix_length]).all():
+            raise ValueError("action_prefix actions are not finite after normalization (out of float32 range)")
         return _rtc.ActionPrefix(
             actions=jnp.asarray(model_actions)[None],
             delay=jnp.asarray([delay], jnp.int32),
@@ -171,8 +179,8 @@ class Policy(BasePolicy):
 
 
 def _integer(value: Any, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-        if isinstance(value, (float, np.floating)) and math.isfinite(value) and float(value).is_integer():
+    if isinstance(value, bool) or not isinstance(value, int | np.integer):
+        if isinstance(value, float | np.floating) and math.isfinite(value) and float(value).is_integer():
             return int(value)
         raise ValueError(f"action_prefix {name} must be an integer, got {value!r}")
     return int(value)

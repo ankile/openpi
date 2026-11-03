@@ -43,7 +43,7 @@ class Pi0Config(_model.BaseModelConfig):
         if self.simulated_delay is not None:
             if not self.pi05:
                 raise ValueError("simulated_delay (real-time chunking) is implemented for pi0.5 only")
-            if not 1 <= self.simulated_delay < self.action_horizon:
+            if type(self.simulated_delay) is not int or not 1 <= self.simulated_delay < self.action_horizon:
                 raise ValueError(
                     f"simulated_delay must be in [1, action_horizon={self.action_horizon}) so every example keeps a "
                     f"supervised action, got {self.simulated_delay}"

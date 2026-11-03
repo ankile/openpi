@@ -93,6 +93,10 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 def _sample_kwargs(args: Args | None) -> dict:
     if args is None:
         return {}
+    if type(args.num_steps) is not int or args.num_steps < 1:
+        raise ValueError(f"num_steps must be a positive integer, got {args.num_steps!r}")
+    if not args.max_guidance_weight > 0:
+        raise ValueError(f"max_guidance_weight must be positive, got {args.max_guidance_weight!r}")
     # openpi's default step count is left to the model, so a request without a prefix runs upstream's graph
     out = {"max_guidance_weight": args.max_guidance_weight}
     if args.num_steps != 10:
@@ -143,11 +147,12 @@ def warm_up(policy: _policy.Policy) -> dict:
     if policy.rtc is not None:
         horizon, width = policy.rtc["action_horizon"], policy.rtc["action_dim"]
         example = droid_policy.make_droid_example()
-        delay = 1 if policy.rtc["mode"] == "inpaint" else 2
+        prefix_length = horizon // 2
+        delay = 2 if policy.rtc["mode"] == "guidance" else policy.rtc["simulated_delay"] - 1
         example["action_prefix"] = {
             "actions": np.zeros((horizon, width), np.float32),
-            "delay": delay,
-            "prefix_length": horizon // 2,
+            "delay": min(delay, prefix_length),
+            "prefix_length": prefix_length,
         }
         started = time.monotonic()
         policy.infer(example)
@@ -156,10 +161,16 @@ def warm_up(policy: _policy.Policy) -> dict:
     return timings
 
 
+def should_warm_up(args: Args, policy: _policy.Policy) -> bool:
+    """Warm-up sends DROID inputs: only to a policy with prefix support (DROID by construction) or the
+    default DROID policy, never to an explicit checkpoint of another kind."""
+    return args.warm_up and (policy.rtc is not None or (isinstance(args.policy, Default) and args.env == EnvMode.DROID))
+
+
 def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
-    if args.warm_up and (policy.rtc is not None or args.env == EnvMode.DROID):
+    if should_warm_up(args, policy):
         warm_up(policy)
 
     # Record the policy's behavior.

@@ -1,3 +1,4 @@
+# ruff: noqa: SLF001  # tests reach into the model and policy internals they test
 """zima/rtc: real-time chunking in pi0.5 (training-time RTC, 2512.05964; inference-time guidance, 2506.07339).
 
 A tiny pi0.5 (dummy Gemma experts, a one-layer SigLIP) so the tests run on CPU. Parameters are perturbed
@@ -90,7 +91,7 @@ def _prefix(actions, delay, prefix_length):
 
 def test_simulated_delay_validation():
     assert _config(simulated_delay=H - 1).simulated_delay == H - 1
-    for bad in (0, H, H + 3):
+    for bad in (0, H, H + 3, True, 1.5):
         with pytest.raises(ValueError, match="simulated_delay"):
             _config(simulated_delay=bad)
     with pytest.raises(ValueError, match="pi0.5"):
@@ -110,13 +111,13 @@ def _upstream_modules():
             pytest.skip(f"upstream source not available: {e}")
 
     gemma = types.ModuleType("upstream_gemma")
-    exec(compile(show("src/openpi/models/gemma.py"), "upstream_gemma.py", "exec"), gemma.__dict__)  # noqa: S102
+    exec(compile(show("src/openpi/models/gemma.py"), "upstream_gemma.py", "exec"), gemma.__dict__)
     src = show("src/openpi/models/pi0.py")
     line = "import openpi.models.gemma as _gemma\n"
     assert line in src
     pi0 = types.ModuleType("upstream_pi0")
     pi0.__dict__["_gemma"] = gemma
-    exec(compile(src.replace(line, ""), "upstream_pi0.py", "exec"), pi0.__dict__)  # noqa: S102
+    exec(compile(src.replace(line, ""), "upstream_pi0.py", "exec"), pi0.__dict__)
     return pi0
 
 
@@ -245,6 +246,30 @@ def test_prefix_refused_for_pi0():
             action_prefix=None,
             max_guidance_weight=5.0,
         )
+
+
+def test_bf16_sampling_and_training_are_finite(models):
+    """The production dtype: bf16 activations through inpainting, guidance and the RTC loss."""
+    plain, _ = models
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_pi0, "_siglip", _tiny_siglip())
+        bf16_rtc = (
+            _config(simulated_delay=3)
+            .__class__(**{**dataclasses.asdict(_config(simulated_delay=3)), "dtype": "bfloat16"})
+            .create(jax.random.key(0))
+        )
+        bf16_plain = (
+            _config().__class__(**{**dataclasses.asdict(_config()), "dtype": "bfloat16"}).create(jax.random.key(0))
+        )
+    nnx.update(bf16_rtc, nnx.state(plain))
+    nnx.update(bf16_plain, nnx.state(plain))
+    obs, act = _obs_act(_config())
+    prefix = _prefix(jax.random.normal(jax.random.key(5), (BATCH, H, 32)), [2, 3], [5, 6])
+    for model in (bf16_rtc, bf16_plain):
+        out = nnx_utils.module_jit(model.sample_actions)(jax.random.key(1), obs, num_steps=3, action_prefix=prefix)
+        assert np.isfinite(np.asarray(out, np.float32)).all()
+    loss = nnx_utils.module_jit(bf16_rtc.compute_loss)(jax.random.key(2), obs, act)
+    assert np.isfinite(np.asarray(loss, np.float32)).all()
 
 
 # --- inference-time guidance (2506.07339) ------------------------------------------------------------------------

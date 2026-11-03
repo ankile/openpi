@@ -5,9 +5,9 @@ from typing import Any
 
 import jax.numpy as jnp
 
+from openpi.models import rtc as _rtc
 import openpi.models.model as _model
 import openpi.models.pi0_config as _pi0_config
-from openpi.models import rtc as _rtc
 from openpi.policies import droid_policy
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
@@ -50,6 +50,8 @@ def create_trained_policy(
         presence of "model.safensors" in the checkpoint directory.
     """
     repack_transforms = repack_transforms or transforms.Group()
+    if "num_steps" in (sample_kwargs or {}) and not isinstance(train_config.model, _pi0_config.Pi0Config):
+        raise ValueError(f"num_steps applies to flow-matching pi0/pi0.5 models only, not {train_config.name}")
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
 
     # Check if this is a PyTorch model by looking for model.safetensors
