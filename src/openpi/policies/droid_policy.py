@@ -6,6 +6,9 @@ import numpy as np
 from openpi import transforms
 from openpi.models import model as _model
 
+# zima/rtc: DROID's raw action width, joint velocities (7) + gripper position (1); DroidOutputs keeps these dims.
+DROID_ACTION_DIM = 8
+
 
 def make_droid_example() -> dict:
     """Creates a random input example for the Droid policy."""
@@ -78,4 +81,4 @@ class DroidInputs(transforms.DataTransformFn):
 class DroidOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # Only return the first 8 dims.
-        return {"actions": np.asarray(data["actions"][..., :8])}
+        return {"actions": np.asarray(data["actions"][..., :DROID_ACTION_DIM])}

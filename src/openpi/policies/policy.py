@@ -1,5 +1,7 @@
+from collections.abc import Callable
 from collections.abc import Sequence
 import logging
+import math
 import pathlib
 import time
 from typing import Any, TypeAlias
@@ -15,6 +17,7 @@ from typing_extensions import override
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
+from openpi.models import rtc as _rtc
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
@@ -33,6 +36,8 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
+        action_prefix_transform: Callable[[np.ndarray], np.ndarray] | None = None,
+        rtc: dict[str, Any] | None = None,
     ):
         """Initialize the Policy.
 
@@ -46,12 +51,24 @@ class Policy(BasePolicy):
             pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda:0").
                           Only relevant when is_pytorch=True.
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
+            action_prefix_transform: zima/rtc: maps a raw action prefix (H, raw action dim) to model space with
+                the action transforms only (normalize, pad). With it (and `rtc`), a request may carry
+                `action_prefix` = {"actions", "delay", "prefix_length"} (real-time chunking).
+            rtc: zima/rtc: what the server does with an action prefix; announced in the metadata as `rtc`.
         """
         self._model = model
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
         self._sample_kwargs = sample_kwargs or {}
         self._metadata = metadata or {}
+        if (action_prefix_transform is None) != (rtc is None):
+            raise ValueError("action_prefix_transform and rtc go together")
+        if rtc is not None and is_pytorch:
+            raise ValueError("real-time chunking is implemented for JAX models only")
+        self._action_prefix_transform = action_prefix_transform
+        self._rtc = rtc
+        if rtc is not None:
+            self._metadata = {**self._metadata, "rtc": rtc}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
 
@@ -68,6 +85,8 @@ class Policy(BasePolicy):
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        raw_prefix = inputs.pop("action_prefix", None)
+        action_prefix = None if raw_prefix is None else self._action_prefix(raw_prefix)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -86,6 +105,8 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+        if action_prefix is not None:
+            sample_kwargs["action_prefix"] = action_prefix
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
@@ -108,6 +129,53 @@ class Policy(BasePolicy):
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
+
+    @property
+    def rtc(self) -> dict[str, Any] | None:
+        return self._rtc
+
+    def _action_prefix(self, raw: Any) -> _rtc.ActionPrefix:
+        """Validate a request's action prefix and bring it to model space (batch of one).
+
+        The actions stay as the robot recorded them (raw action space, the recorded action labels); only the
+        action transforms run on them, so their model-space values are what training saw for the same labels.
+        """
+        if self._rtc is None:
+            raise ValueError("this server takes no action_prefix (real-time chunking is not enabled for it)")
+        if not isinstance(raw, dict) or set(raw) != {"actions", "delay", "prefix_length"}:
+            raise ValueError("action_prefix must be {'actions', 'delay', 'prefix_length'}")
+        horizon, width = self._rtc["action_horizon"], self._rtc["action_dim"]
+        actions = np.asarray(raw["actions"])
+        if actions.shape != (horizon, width) or not np.issubdtype(actions.dtype, np.number):
+            raise ValueError(f"action_prefix actions must be numbers of shape ({horizon}, {width}), got {actions.shape}")
+        actions = actions.astype(np.float64)
+        if not np.isfinite(actions).all():
+            raise ValueError("action_prefix actions must be finite")
+        delay, prefix_length = (_integer(raw[k], k) for k in ("delay", "prefix_length"))
+        if not 0 <= delay <= prefix_length <= horizon:
+            raise ValueError(
+                f"action_prefix needs 0 <= delay <= prefix_length <= {horizon}, got delay {delay}, "
+                f"prefix_length {prefix_length}"
+            )
+        if self._rtc["mode"] == "inpaint" and delay > self._rtc["simulated_delay"] - 1:
+            raise ValueError(
+                f"delay {delay} is outside the trained range 0..{self._rtc['simulated_delay'] - 1} "
+                "(simulated_delay); the model never saw a longer prefix"
+            )
+        model_actions = np.asarray(self._action_prefix_transform(actions), np.float32)
+        return _rtc.ActionPrefix(
+            actions=jnp.asarray(model_actions)[None],
+            delay=jnp.asarray([delay], jnp.int32),
+            prefix_length=jnp.asarray([prefix_length], jnp.int32),
+        )
+
+
+def _integer(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        if isinstance(value, (float, np.floating)) and math.isfinite(value) and float(value).is_integer():
+            return int(value)
+        raise ValueError(f"action_prefix {name} must be an integer, got {value!r}")
+    return int(value)
 
 
 class PolicyRecorder(_base_policy.BasePolicy):

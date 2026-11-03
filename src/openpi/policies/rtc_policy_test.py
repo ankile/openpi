@@ -1,0 +1,158 @@
+"""zima/rtc: the server side of real-time chunking. The real DROID transforms and pi05_droid norm stats around a
+fake model that echoes the prefix it is given, so no weights are needed (the norm stats and tokenizer come
+from openpi's download cache)."""
+
+import dataclasses
+import pathlib
+
+import flax.nnx as nnx
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from openpi.models import pi0_config
+from openpi.models import rtc
+from openpi.policies import droid_policy
+from openpi.policies import policy_config as _policy_config
+from openpi.shared import download
+from openpi.shared import normalize
+import openpi.transforms as _transforms
+from openpi.training import config as _config
+
+
+class EchoModel(nnx.Module):
+    """Returns the model-space prefix when given one, else zeros; records nothing else."""
+
+    def __init__(self, config: pi0_config.Pi0Config):
+        self.action_horizon, self.action_dim = config.action_horizon, config.action_dim
+        self.offset = nnx.Param(jnp.zeros(()))
+
+    def sample_actions(self, rng, observation, *, action_prefix=None, **kwargs):
+        batch = observation.state.shape[0]
+        if action_prefix is None:
+            return jnp.zeros((batch, self.action_horizon, self.action_dim)) + self.offset.value
+        return action_prefix.actions + self.offset.value
+
+
+def _droid_norm_stats():
+    path = download.get_cache_dir() / "openpi-assets/checkpoints/pi05_droid/assets/droid"
+    if not (path / "norm_stats.json").exists():
+        pytest.skip(f"pi05_droid norm stats are not in the openpi cache ({path})")
+    return normalize.load(path)
+
+
+def _policy(monkeypatch, name, **kwargs):
+    """The policy create_trained_policy serves for `name`, around the echo model, with pi05_droid's norm stats
+    (which every DROID fine-tune reuses)."""
+    config = _config.get_config(name)
+    monkeypatch.setattr(pi0_config.Pi0Config, "load", lambda self, params, **_: EchoModel(self))
+    monkeypatch.setattr(_policy_config._model, "restore_params", lambda *a, **k: None)
+    original = download.maybe_download
+    monkeypatch.setattr(
+        download,
+        "maybe_download",
+        lambda path, **kw: pathlib.Path(path) if path == "/nonexistent" else original(path, **kw),
+    )
+    return _policy_config.create_trained_policy(config, "/nonexistent", norm_stats=_droid_norm_stats(), **kwargs)
+
+
+def _request(prefix=None):
+    example = droid_policy.make_droid_example()
+    if prefix is not None:
+        example["action_prefix"] = prefix
+    return example
+
+
+def _raw_prefix(horizon, seed=0):
+    rng = np.random.default_rng(seed)
+    actions = np.concatenate([rng.uniform(-0.6, 0.6, (horizon, 7)), rng.uniform(0, 1, (horizon, 1))], axis=1)
+    return actions.astype(np.float32)
+
+
+def test_rtc_config_is_the_published_recipe_plus_simulated_delay():
+    base, rtc_config = _config.get_config("pi05_droid_finetune"), _config.get_config("pi05_droid_finetune_rtc")
+    assert rtc_config.model.simulated_delay == 8
+    assert base.model.simulated_delay is None
+    assert dataclasses.replace(rtc_config.model, simulated_delay=None) == base.model
+    assert dataclasses.replace(rtc_config, name=base.name, model=base.model) == base
+
+
+def test_metadata_says_what_the_server_does(monkeypatch):
+    inpaint = _policy(monkeypatch, "pi05_droid_finetune_rtc")
+    assert inpaint.metadata["rtc"] == {
+        "protocol": 1,
+        "mode": "inpaint",
+        "simulated_delay": 8,
+        "action_horizon": 16,
+        "action_dim": 8,
+        "num_steps": 10,
+        "guidance": None,
+    }
+    guided = _policy(monkeypatch, "pi05_droid", sample_kwargs={"max_guidance_weight": 2.0})
+    assert guided.metadata["rtc"]["mode"] == "guidance"
+    assert guided.metadata["rtc"]["action_horizon"] == 15
+    assert guided.metadata["rtc"]["guidance"] == {"max_weight": 2.0, "schedule": "exp"}
+    assert "rtc" not in _policy(monkeypatch, "pi05_droid", rtc=False).metadata
+    # a non-DROID pipeline gets no prefix support, nor does pi0
+    for name in ("pi05_libero", "pi0_droid"):
+        config = _config.get_config(name)
+        data_config = config.data.create(config.assets_dirs, config.model)
+        assert not _policy_config._actions_pass_through(config, data_config, _transforms.Group())
+
+
+def test_prefix_round_trip_through_the_action_transforms(monkeypatch):
+    """raw labels -> Normalize (quantile) -> pad -> [model echoes] -> Unnormalize -> DroidOutputs = raw labels."""
+    policy = _policy(monkeypatch, "pi05_droid_finetune_rtc")
+    raw = _raw_prefix(16)
+    model_space = policy._action_prefix_transform(raw.astype(np.float64))
+    assert model_space.shape == (16, 32)
+    np.testing.assert_array_equal(model_space[:, 8:], 0.0)  # padded dims are zero, as in training
+    out = policy.infer(_request({"actions": raw, "delay": 3, "prefix_length": 8}))
+    np.testing.assert_allclose(out["actions"], raw, atol=1e-5)
+    # no prefix: the plain path (the echo model's zeros, un-normalized)
+    assert policy.infer(_request())["actions"].shape == (16, 8)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "match"),
+    [
+        ({"actions": np.zeros((16, 8)), "delay": 5, "prefix_length": 4}, "delay <= prefix_length"),
+        ({"actions": np.zeros((16, 8)), "delay": 8, "prefix_length": 10}, "trained range"),
+        ({"actions": np.zeros((16, 8)), "delay": -1, "prefix_length": 4}, "0 <= delay"),
+        ({"actions": np.zeros((16, 8)), "delay": 1, "prefix_length": 17}, "prefix_length <= 16"),
+        ({"actions": np.full((16, 8), np.nan), "delay": 1, "prefix_length": 4}, "finite"),
+        ({"actions": np.zeros((15, 8)), "delay": 1, "prefix_length": 4}, "shape"),
+        ({"actions": np.zeros((16, 7)), "delay": 1, "prefix_length": 4}, "shape"),
+        ({"actions": np.zeros((16, 8)), "delay": True, "prefix_length": 4}, "integer"),
+        ({"actions": np.zeros((16, 8)), "delay": 1.5, "prefix_length": 4}, "integer"),
+        ({"actions": np.zeros((16, 8)), "delay": 1}, "action_prefix must be"),
+        ({"actions": np.zeros((16, 8)), "delay": 1, "prefix_length": 4, "extra": 0}, "action_prefix must be"),
+    ],
+)
+def test_bad_prefixes_are_refused(monkeypatch, prefix, match):
+    policy = _policy(monkeypatch, "pi05_droid_finetune_rtc")
+    with pytest.raises(ValueError, match=match):
+        policy.infer(_request(prefix))
+
+
+def test_guidance_has_no_trained_range_but_keeps_the_rest(monkeypatch):
+    policy = _policy(monkeypatch, "pi05_droid")
+    out = policy.infer(_request({"actions": _raw_prefix(15), "delay": 9, "prefix_length": 12}))
+    assert out["actions"].shape == (15, 8)
+    with pytest.raises(ValueError, match="delay <= prefix_length"):
+        policy.infer(_request({"actions": _raw_prefix(15), "delay": 9, "prefix_length": 8}))
+
+
+def test_a_server_without_rtc_refuses_a_prefix(monkeypatch):
+    policy = _policy(monkeypatch, "pi05_droid", rtc=False)
+    with pytest.raises(ValueError, match="takes no action_prefix"):
+        policy.infer(_request({"actions": _raw_prefix(15), "delay": 1, "prefix_length": 4}))
+
+
+def test_prefix_is_passed_as_arrays(monkeypatch):
+    policy = _policy(monkeypatch, "pi05_droid_finetune_rtc")
+    prefix = policy._action_prefix({"actions": _raw_prefix(16), "delay": np.int64(2), "prefix_length": 9})
+    assert isinstance(prefix, rtc.ActionPrefix)
+    assert prefix.actions.shape == (1, 16, 32)
+    assert prefix.delay.dtype == jnp.int32
+    assert prefix.prefix_length.tolist() == [9]
